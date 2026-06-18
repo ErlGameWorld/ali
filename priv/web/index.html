@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ali Web</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="layout">
+    <header class="header">
+      <span class="brand-title">ali</span>
+      <span class="brand-meta">Erlang 节点内智能开发助手 · edit 模式写文件需「批准执行」</span>
+    </header>
+
+    <div id="approveBar" class="approve-bar hidden">
+      <span id="approveText">有待确认的操作</span>
+      <button id="btnApprove" type="button">批准执行</button>
+      <button id="btnDismissApprove" type="button" class="btn-muted">忽略</button>
+    </div>
+
+    <div id="tasksPanel" class="tasks-panel hidden">
+      <div class="tasks-header">
+        <strong>后台任务</strong>
+        <button id="btnCloseTasks" type="button" class="btn-muted">关闭</button>
+      </div>
+      <ul id="tasksList"></ul>
+    </div>
+
+    <main class="chat" id="chat"></main>
+
+    <footer class="composer">
+      <textarea id="prompt" rows="2" placeholder="输入问题，例如：分析 alLoop 的工作流程"></textarea>
+      <div class="composer-bar">
+        <div class="composer-left">
+          <label>模式
+            <select id="modeSelect">
+              <option value="ask">ask（只读）</option>
+              <option value="edit">edit（编辑）</option>
+              <option value="exec">exec（执行）</option>
+            </select>
+          </label>
+          <label>会话
+            <select id="sessionSelect">
+              <option value="">当前会话</option>
+            </select>
+          </label>
+          <button id="btnRefreshIndex" type="button" class="btn-muted btn-xs">索引</button>
+          <button id="btnTasks" type="button" class="btn-muted btn-xs">任务</button>
+          <button id="btnClear" type="button" class="btn-muted btn-xs">清空</button>
+          <button id="btnEunit" type="button" class="btn-muted btn-xs">EUnit</button>
+        </div>
+        <div class="composer-right">
+          <span id="statusText" class="status">就绪</span>
+          <button id="btnSend" type="button" class="btn-send">发送</button>
+        </div>
+      </div>
+    </footer>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
