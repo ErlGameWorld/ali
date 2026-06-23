@@ -44,6 +44,19 @@ ali:ask("分析问题", #{
 | `run/1` | `run({Mod, Fun, Args})` — exec 模式执行（黑名单拦截） |
 | `run/3` | `run(Mod, Fun, Args)` |
 | `approve/1` | 确认待执行的写操作（edit 模式返回的 TaskId） |
+| `pendingTask/1` | 查询挂起任务的预览（含 diff），供 Web UI 可视化确认 |
+| `mcpConnect/1` | 连接一个 MCP Server（stdio 或 Streamable HTTP）并自动发现工具/资源/提示 |
+| `mcpConnectAll/0` | 连接 config.cfg `mcpServers` 配置的全部 Server |
+| `mcpDisconnect/1` | 断开 MCP Server 并注销其工具 |
+| `mcpServers/0` | 列出已连接的 MCP Server 与状态（含 transport/能力/资源/提示数） |
+| `mcpTools/0` | 列出已发现的 MCP 工具名 |
+| `mcpCall/3` | 直接调用某 MCP Server 的远程工具 |
+| `mcpResources/0` | 聚合列出所有 MCP Server 的资源 |
+| `mcpReadResource/2` | 读取某 MCP Server 的资源内容（resources/read） |
+| `mcpPrompts/0` | 聚合列出所有 MCP Server 的提示模板 |
+| `mcpGetPrompt/3` | 获取某 MCP Server 的提示模板（prompts/get） |
+| `mcpListResources/1` | 列出指定 MCP Server 的资源清单 |
+| `mcpListPrompts/1` | 列出指定 MCP Server 的提示模板清单 |
 
 ### 状态与工具
 
@@ -92,6 +105,19 @@ ali:ask("分析问题", #{
 | `startWeb/0` | 启动 HTTP 服务 |
 | `stopWeb/0` | 停止 Web 服务 |
 | `webStatus/0` | 运行状态与端口 |
+
+#### Web 端点（默认 `http://127.0.0.1:8088`）
+
+- `GET /` — Web UI 首页；`GET /static/*` — 静态资源。
+- `GET /ws` — **WebSocket** 升级端点。JSON 命令 `{"type": ...}`：
+  - 控制面（请求-响应）：`status` / `tools` / `metrics` / `plan` / `tasks` / `audit` / `pending` / `approve` / `mode` / `previewPatch`。
+  - 问答：`{"type":"ask","prompt":"...","sessionId":"web"}`，服务端主动推送 `token` / `progress` / `done` 帧。
+- REST（WS 不可用时回退）：`POST /api/ask`、`GET|POST /api/ask/stream`（SSE）、`POST /api/preview/patch`（diff 预览）、`GET /api/pending/:taskId`（挂起预览含 diff）、`GET /api/metrics`、`GET /api/plan`、`GET /api/tasks`、`POST /api/approve` 等。
+- 安全加固（见 `alWebSec`）：
+  - 认证：配置 `webApiToken` 后，除静态资源/首页/`GET /api/health` 外需携带 `Authorization: Bearer <token>` 或 `?token=<token>`（常数时间比较，WS 握手用 query 传递）；未配置 token 时读请求放行，写请求（含 `/ws` 升级）仅限本地回环（`webAllowRemoteWrites` 可放开）。未授权请求返回 `401`。
+  - CORS：按 `webAllowOrigin` 白名单放行，`OPTIONS` 预检返回 `204`；默认不放行跨源。
+  - 速率限制：按来源 IP 固定窗口计数（`webRateLimit`/`webRateWindowMs`），超限返回 `429`。
+  - 安全头：所有响应附带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；写请求记录来源 IP。
 
 ---
 

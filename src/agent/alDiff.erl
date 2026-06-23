@@ -12,6 +12,8 @@
 
 %% @doc 比较两段文本并返回格式化的 diff 结果。
 %% 内部将输入按换行符拆分为行列表，经 LCS 回溯得到编辑序列后格式化输出。
+%% DP 表使用 `array:array(array:array(integer()))` 实现 O(1) 随机访问，
+%% 避免原 `lists:nth` 的 O(N³) 级回溯复杂度。
 %% @param Old 修改前的文件内容（binary）
 %% @param New 修改后的文件内容（binary）
 %% @returns `{binary()}` 每行一条 diff，以换行符连接
@@ -37,27 +39,51 @@ lcs_diff(OldLines, NewLines) ->
     lists:reverse(format_edits(Edits, [])).
 
 %% ===== DP LCS table =====
-%% 构建 LCS 动态规划表：Table[I][J] 表示 OldLines 前 I 行与 NewLines 前 J 行的 LCS 长度
-build_lcs_table([], _) -> [[]];
-build_lcs_table(_, []) -> [[]];
+%% 构建 LCS 动态规划表：每行为 `array:array(integer())`，Table 是 `list(array)`。
+%% Table[I] 为第 I 行（I 从 1 开始），Table[I][J] 表示 OldLines 前 I 行与
+%% NewLines 前 J 行的 LCS 长度（J 列从 0 开始，0 列均为 0）。
+build_lcs_table([], _NewLines) -> [];
+build_lcs_table(_OldLines, []) -> [];
 build_lcs_table(OldLines, NewLines) ->
     N = length(NewLines),
-    InitRow = lists:duplicate(N + 1, 0),
-    {_, Table} = lists:foldl(fun(OL, {PrevRow, Acc}) ->
-        Row = build_row(OL, NewLines, PrevRow, [0]),
+    InitRow = array:new(N + 1, {default, 0}),
+    {_, TableList} = lists:foldl(fun(OL, {PrevRow, Acc}) ->
+        Row = build_row_array(OL, NewLines, PrevRow, N),
         {Row, [Row | Acc]}
     end, {InitRow, []}, OldLines),
-    lists:reverse([InitRow | Table]).
+    %% Table 按行索引 I=1..M，每行含列 J=0..N；0 列始终为 0
+    [InitRow | lists:reverse(TableList)].
 
-%% 计算 DP 表中单行的各列 LCS 长度值
-build_row(_OL, [], _PrevRow, Acc) ->
-    lists:reverse(Acc);
-build_row(OL, [NL | Ns], [Above | AboveRest] = _PrevRow, [Diag | _] = Acc) ->
-    Val = case OL =:= NL of
-        true -> Diag + 1;
-        false -> max(hd(Acc), Above)
-    end,
-    build_row(OL, Ns, AboveRest, [Val | Acc]).
+%% 用 array 构建 DP 表的单行：Row[J] = LCS(OldLines[1..I], NewLines[1..J])
+%% 遍历 NewLines 各列（J 从 1 开始），用前一行 (Above) 与本行前一列 (Left) 及对角线值计算
+build_row_array(_OL, _NewLines, _PrevRow, 0) ->
+    %% N=0 时仅一行 0 列
+    array:new(1, {default, 0});
+build_row_array(OL, NewLines, PrevRow, N) ->
+    NewLineList = lists:reverse(NewLines),
+    {_, Row} = lists:foldl(fun(NL, {J, Arr}) ->
+        Diag = array:get(J - 1, PrevRow),
+        Above = array:get(J, PrevRow),
+        Left = array:get(J - 1, Arr),
+        Val = case OL =:= NL of
+            true -> Diag + 1;
+            false -> max(Left, Above)
+        end,
+        {J + 1, array:set(J, Val, Arr)}
+    end, {1, array:set(0, 0, array:new(N + 1, {default, 0}))}, NewLineList),
+    Row.
+
+%% 读取 DP 表中 (I, J) 位置的 LCS 长度；越界返回 0。
+%% Table[I] 为第 I 行 array，索引 J 从该行取值。
+cell([_InitRow | _Rows], _I, J) when J < 1 -> 0;
+cell([_InitRow | _Rows], I, _J) when I < 1 -> 0;
+cell([_InitRow | Rows], I, J) ->
+    case I > length(Rows) orelse J > array:size(hd(Rows)) - 1 of
+        true -> 0;
+        false ->
+            Row = lists:nth(I, Rows),
+            array:get(J, Row)
+    end.
 
 %% ===== Backtrack =====
 %% 从 DP 表右下角回溯，生成 `{add, LineNo, Line}` 或 `{del, LineNo, Line}` 编辑序列
@@ -81,13 +107,6 @@ backtrack(Table, [OL | RestO], [NL | RestN], I, J, Acc) ->
                 backtrack(Table, [OL | RestO], RestN, I, J - 1,
                     [{add, J, NL} | Acc])
             end
-    end.
-
-%% 读取 DP 表中 (I, J) 位置的 LCS 长度；越界返回 0
-cell(Table, I, J) ->
-    case I < 1 orelse J < 1 of
-        true -> 0;
-        false -> lists:nth(J, lists:nth(I, Table))
     end.
 
 %% 将剩余旧行全部标记为删除编辑

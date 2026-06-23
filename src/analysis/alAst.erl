@@ -8,11 +8,11 @@
 -module(alAst).
 
 -export([
-    parse_file/1,
-    module_from_forms/1,
-    function_calls/4,
-    find_callers/2,
-    call_graph_edges/1
+    parseFile/1,
+    moduleFromForms/1,
+    functionCalls/4,
+    findCallers/2,
+    callGraphEdges/1
 ]).
 
 -type call_info() :: #{
@@ -24,8 +24,8 @@
 }.
 
 %% @doc 解析 Erlang 源文件为 abstract_form 列表。
--spec parse_file(string()) -> {ok, [erl_parse:abstract_form()]} | {error, term()}.
-parse_file(Path) ->
+-spec parseFile(string()) -> {ok, [erl_parse:abstract_form()]} | {error, term()}.
+parseFile(Path) ->
     Opts = [{encoding, utf8}, {record_name, true}],
     {ok, _} = application:ensure_all_started(syntax_tools),
     case epp_dodger:parse_file(Path, Opts) of
@@ -36,22 +36,22 @@ parse_file(Path) ->
     end.
 
 %% @doc 从 abstract forms 中提取 -module 声明的模块名。
--spec module_from_forms([erl_parse:abstract_form()]) -> atom() | undefined.
-module_from_forms(Forms) ->
+-spec moduleFromForms([erl_parse:abstract_form()]) -> atom() | undefined.
+moduleFromForms(Forms) ->
     case lists:keyfind(module, 1, Forms) of
         {attribute, _, module, Mod} when is_atom(Mod) -> Mod;
         _ -> undefined
     end.
 
 %% @doc 分析指定函数子句体内的所有调用并去重返回。
--spec function_calls(string(), atom(), atom(), non_neg_integer() | undefined) ->
+-spec functionCalls(string(), atom(), atom(), non_neg_integer() | undefined) ->
     {ok, [call_info()]} | {error, term()}.
-function_calls(File, _Mod, Fun, Arity) ->
-    case parse_file(File) of
+functionCalls(File, _Mod, Fun, Arity) ->
+    case parseFile(File) of
         {ok, Forms} ->
             case find_function_clauses(Forms, Fun, Arity) of
                 {ok, Clauses} ->
-                    Self = module_from_forms(Forms),
+                    Self = moduleFromForms(Forms),
                     Calls = lists:flatmap(fun(Clause) ->
                         collect_calls_in_clause(Clause, Self)
                     end, Clauses),
@@ -65,15 +65,15 @@ function_calls(File, _Mod, Fun, Arity) ->
     end.
 
 %% @doc 在全项目索引模块中查找调用 TargetMod:TargetFun 的调用方。
--spec find_callers(atom(), atom()) -> [{atom(), [map()]}].
-find_callers(TargetMod, TargetFun) ->
-    alCodeIndexer:ensure_started(),
-    All = alCodeIndexer:all_modules(),
+-spec findCallers(atom(), atom()) -> [{atom(), [map()]}].
+findCallers(TargetMod, TargetFun) ->
+    alCodeIndexer:ensureStarted(),
+    All = alCodeIndexer:allModules(),
     lists:foldl(fun(CallerMod, Acc) ->
         case CallerMod =:= TargetMod of
             true -> Acc;
             false ->
-                case alCodeIndexer:lookup_module(CallerMod) of
+                case alCodeIndexer:lookupModule(CallerMod) of
                     {ok, #{absPath := Path}} ->
                         case scan_file_callers(Path, CallerMod, TargetMod, TargetFun) of
                             [] -> Acc;
@@ -85,14 +85,14 @@ find_callers(TargetMod, TargetFun) ->
     end, [], All).
 
 %% @doc 构建模块内各函数到外部模块的远程调用边列表。
--spec call_graph_edges(atom()) -> [#{from => atom(), to => atom(), calls => [atom()]}].
-call_graph_edges(Mod) ->
-    case alCodeIndexer:lookup_module(Mod) of
+-spec callGraphEdges(atom()) -> [#{from => atom(), to => atom(), calls => [atom()]}].
+callGraphEdges(Mod) ->
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, #{absPath := Path, functions := Funs}} ->
             Edges = lists:flatmap(fun(FunInfo) ->
                 Name = maps:get(name, FunInfo),
                 Arity = maps:get(arity, FunInfo, 0),
-                case function_calls(Path, Mod, Name, Arity) of
+                case functionCalls(Path, Mod, Name, Arity) of
                     {ok, Calls} ->
                         Remotes = [
                             #{from => Mod, to => T, via => Name} ||
@@ -109,9 +109,9 @@ call_graph_edges(Mod) ->
 
 %% 扫描单文件 AST，筛选匹配目标 Mod:Fun 的调用点。
 scan_file_callers(Path, CallerMod, TargetMod, TargetFun) ->
-    case parse_file(Path) of
+    case parseFile(Path) of
         {ok, Forms} ->
-            Self = module_from_forms(Forms),
+            Self = moduleFromForms(Forms),
             AllCalls = collect_calls_in_forms(Forms, Self),
             [#{line => maps:get(line, C, undefined), kind => maps:get(kind, C)}
              || C <- AllCalls,

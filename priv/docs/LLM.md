@@ -317,4 +317,4 @@ end.
 - [API.md](API.md) — `ali` Facade 中的 `llm*` 封装
 - [CONFIG.md](CONFIG.md) — 配置文件与环境变量
 - [ARCHITECTURE.md](ARCHITECTURE.md) — `llmCli` 在架构中的位置
-- 示例代码：[`src/core/llmTest.erl`](../../src/core/llmTest.erl)（演示用，非生产 API）
+- 示例代码：[`test/llmTest.erl`](../../test/llmTest.erl)（演示用，非生产 API）

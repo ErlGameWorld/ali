@@ -15,6 +15,7 @@
     rollbackFile/2,
     formatCode/2,
     listBackups/2,
+    sessionUndo/2,
     previewWrite/2,
     previewPatch/2,
     previewCompileLoad/2
@@ -32,7 +33,7 @@ writeFile(Args, Config) ->
         _ ->
             case alToolProject:resolvePathForEdit(projectRoot(Config), Path) of
                 {ok, AbsPath} ->
-                    maybe_backup(AbsPath, Backup),
+                    maybe_backup(AbsPath, Backup, Config),
                     case file:write_file(AbsPath, toBinary(Content)) of
                         ok ->
                             _ = maybe_reindex(Config),
@@ -48,13 +49,18 @@ writeFile(Args, Config) ->
             end
     end.
 
-%% @doc 在文件中全局替换 `oldText` 为 `newText` 后写回（等价于 patch + write）。
+%% @doc 在文件中替换 `oldText` 为 `newText` 后写回。
+%%
+%% 默认要求 `oldText` 在文件中唯一匹配：若出现多次，返回
+%% `{error, #{reason => ambiguousMatch, ...}}'，提示补充上下文，
+%% 避免误伤其它同名文本。传入 `replaceAll => true' 可强制全局替换。
 -spec patchFile(map(), map()) -> {ok, map()} | {error, term()}.
 patchFile(Args, Config) ->
     Path = maps:get(path, Args, undefined),
     OldText = maps:get(oldText, Args, undefined),
     NewText = maps:get(newText, Args, undefined),
     Backup = maps:get(backup, Args, true),
+    ReplaceAll = maps:get(replaceAll, Args, false),
     case {Path, OldText, NewText} of
         {undefined, _, _} -> {error, missingPath};
         {_, undefined, _} -> {error, missingOldText};
@@ -67,8 +73,21 @@ patchFile(Args, Config) ->
                     case binary:match(Content, OldBin) of
                         nomatch -> {error, oldTextNotFound};
                         _ ->
-                            Patched = binary:replace(Content, OldBin, NewBin, [global]),
-                            writeFile(#{path => Path, content => Patched, backup => Backup}, Config)
+                            Count = countOccurrences(Content, OldBin),
+                            case Count > 1 andalso ReplaceAll =/= true of
+                                true ->
+                                    {error, #{
+                                        reason => ambiguousMatch,
+                                        matchCount => Count,
+                                        hint => <<"oldText 在文件中出现多次；请补充上下文使其唯一，或传入 replaceAll=true 强制全部替换"/utf8>>
+                                    }};
+                                false ->
+                                    Patched = binary:replace(Content, OldBin, NewBin, [global]),
+                                    case writeFile(#{path => Path, content => Patched, backup => Backup}, Config) of
+                                        {ok, R} -> {ok, R#{action => patch, replacements => Count}};
+                                        Err -> Err
+                                    end
+                            end
                     end;
                 {error, Reason} -> {error, Reason}
             end
@@ -110,14 +129,14 @@ compile_by_path(Path, Module, Config) ->
 %% 根据已加载模块反查源码路径再编译。
 compile_by_module(undefined, _Config) ->
     {error, missingPathOrModule};
-compile_by_module(Module, _Config) ->
+compile_by_module(Module, Config) ->
     Mod = to_atom(Module),
     case code:which(Mod) of
         Beam when is_list(Beam) ->
             Src = beam_to_src(Beam, Mod),
             case Src of
                 {ok, SrcPath} ->
-                    compile_by_path(SrcPath, Mod, #{});
+                    compile_by_path(SrcPath, Mod, Config);
                 _ -> {error, sourceNotFound}
             end;
         _ -> {error, moduleNotLoaded}
@@ -181,8 +200,8 @@ rollbackFile(Args, Config) ->
             end
     end.
 
-%% @doc 使用 erl_tidy 格式化项目内 .erl 文件（原地覆盖，可选备份）。
-%% 仅对 .erl 文件生效；其他扩展名返回 {error, notErlangFile}。
+%% @doc 格式化项目内源码文件（原地覆盖，可选备份）。
+%% `.erl'/`.hrl' 用 erl_tidy；`.ex'/`.exs' 用 `mix format'；其他扩展名返回 {error, unsupportedFileType}。
 -spec formatCode(map(), map()) -> {ok, map()} | {error, term()}.
 formatCode(Args, Config) ->
     Path = maps:get(path, Args, undefined),
@@ -191,11 +210,55 @@ formatCode(Args, Config) ->
         undefined -> {error, missingPath};
         _ ->
             case filename:extension(toList(Path)) of
-                ".erl" ->
+                Ext when Ext =:= ".erl"; Ext =:= ".hrl" ->
                     format_erl_file(Path, Backup, Config);
+                Ext when Ext =:= ".ex"; Ext =:= ".exs" ->
+                    format_ex_file(Path, Backup, Config);
                 _ ->
-                    {error, notErlangFile}
+                    {error, unsupportedFileType}
             end
+    end.
+
+%% 使用 `mix format` 格式化 Elixir 文件（原地覆盖，可选备份）。
+%% 需要环境中存在 mix；不可用时返回 {error, mixUnavailable}。
+format_ex_file(Path, Backup, Config) ->
+    case alToolProject:resolvePathForEdit(projectRoot(Config), Path) of
+        {ok, AbsPath} ->
+            case filelib:is_file(AbsPath) of
+                false -> {error, fileNotFound};
+                true ->
+                    case os:find_executable("mix") of
+                        false ->
+                            {error, mixUnavailable};
+                        Mix ->
+                            maybe_backup(AbsPath, Backup, Config),
+                            run_mix_format(Mix, AbsPath, Backup, Config)
+                    end
+            end;
+        {error, Reason} -> {error, Reason}
+    end.
+
+run_mix_format(Mix, AbsPath, Backup, Config) ->
+    Port = open_port({spawn_executable, Mix},
+        [binary, exit_status, hide, stream,
+         {args, ["format", AbsPath]},
+         {cd, binary_to_list(iolist_to_binary(projectRoot(Config)))}]),
+    case collect_port(Port, <<>>) of
+        {0, _Out} ->
+            _ = maybe_reindex(Config),
+            {ok, #{path => AbsPath, action => formatCode, backedUp => Backup, formatter => <<"mix format"/utf8>>}};
+        {Code, Out} ->
+            {error, #{reason => mixFormatFailed, exitCode => Code, output => Out}}
+    end.
+
+%% 收集端口输出直至进程退出，返回 {ExitCode, Output}。
+collect_port(Port, Acc) ->
+    receive
+        {Port, {data, Data}} -> collect_port(Port, <<Acc/binary, Data/binary>>);
+        {Port, {exit_status, Code}} -> {Code, Acc}
+    after 60000 ->
+        try port_close(Port) catch _:_ -> ok end,
+        {timeout, Acc}
     end.
 
 %% 实际执行 erl_tidy 格式化并写回文件。
@@ -205,14 +268,15 @@ format_erl_file(Path, Backup, Config) ->
             case filelib:is_file(AbsPath) of
                 false -> {error, fileNotFound};
                 true ->
-                    maybe_backup(AbsPath, Backup),
-                    case do_erl_tidy(AbsPath) of
-                        ok ->
+                    maybe_backup(AbsPath, Backup, Config),
+                    case do_format_erl(AbsPath) of
+                        {ok, Formatter} ->
                             _ = maybe_reindex(Config),
                             {ok, #{
                                 path => AbsPath,
                                 action => formatCode,
-                                backedUp => Backup
+                                backedUp => Backup,
+                                formatter => Formatter
                             }};
                         {error, Reason} ->
                             {error, Reason}
@@ -221,20 +285,51 @@ format_erl_file(Path, Backup, Config) ->
         {error, Reason} -> {error, Reason}
     end.
 
-%% 调用 erl_tidy:file/2 格式化文件（原地覆盖）。
-%% erl_tidy 依赖 syntax_tools，失败时返回带原因的错误。
-do_erl_tidy(AbsPath) ->
+%% 格式化 .erl 文件（原地覆盖）。优先使用 erlfmt（社区主流，OTP 28+ 唯一可用）；
+%% 若 erlfmt 不可用（极老环境）则回退 erl_tidy（OTP 27 及以前）。
+do_format_erl(AbsPath) ->
+    case code:ensure_loaded(erlfmt) of
+        {module, erlfmt} -> format_with_erlfmt(AbsPath);
+        _ -> format_with_erl_tidy(AbsPath)
+    end.
+
+%% 使用 erlfmt 格式化：format_file/2 返回格式化后的 chardata，需自行写回。
+format_with_erlfmt(AbsPath) ->
+    try erlfmt:format_file(AbsPath, []) of
+        {ok, Formatted, _Warnings} ->
+            case file:write_file(AbsPath, unicode:characters_to_binary(Formatted)) of
+                ok -> {ok, <<"erlfmt"/utf8>>};
+                {error, WErr} -> {error, #{reason => writeFailed, detail => WErr}}
+            end;
+        {skip, _Raw} ->
+            {ok, <<"erlfmt (skipped)"/utf8>>};
+        {error, Err} ->
+            {error, #{reason => erlfmtFailed, detail => formatErlfmtError(Err)}}
+    catch
+        Class:CReason ->
+            {error, #{reason => erlfmtFailed, class => Class, detail => CReason}}
+    end.
+
+%% 将 erlfmt 的 error_info（{File, Loc, Mod, Reason}）转为可读 binary。
+formatErlfmtError({_File, Loc, Mod, Reason}) ->
+    unicode:characters_to_binary(
+        io_lib:format("~p at ~p: ~p", [Mod, Loc, Reason]));
+formatErlfmtError(Other) ->
+    unicode:characters_to_binary(io_lib:format("~p", [Other])).
+
+%% 旧环境回退：erl_tidy（OTP 28 起已从 syntax_tools 移除）。
+format_with_erl_tidy(AbsPath) ->
     case application:ensure_all_started(syntax_tools) of
         {ok, _} ->
             try erl_tidy:file(AbsPath, [{backups, false}, {io, none}]) of
-                ok -> ok;
+                ok -> {ok, <<"erl_tidy"/utf8>>};
                 {error, Reason} -> {error, Reason}
             catch
                 Class:Reason ->
                     {error, #{class => Class, reason => Reason}}
             end;
         {error, Reason} ->
-            {error, {syntax_tools_unavailable, Reason}}
+            {error, {erlFormatterUnavailable, Reason}}
     end.
 
 %% @doc 列出指定项目文件的所有备份记录（按时间降序）。
@@ -260,6 +355,13 @@ listBackups(Args, Config) ->
                 {error, Reason} -> {error, Reason}
             end
     end.
+
+%% @doc 会话级回滚：将当前会话中修改的所有文件恢复到会话开始前的状态。
+%% sessionId 从 Config 中获取（默认 "default"）。
+-spec sessionUndo(map(), map()) -> {ok, map()} | {error, term()}.
+sessionUndo(_Args, Config) ->
+    SessionId = maps:get(sessionId, Config, <<"default"/utf8>>),
+    alBackup:restore_session(SessionId).
 
 %% @doc 预览写文件操作的 diff，不实际修改磁盘。
 -spec previewWrite(map(), map()) -> {ok, map()} | {error, term()}.
@@ -332,17 +434,20 @@ previewCompileLoad(Args, Config) ->
             end
     end.
 
-%% 编辑前按需创建备份。
-maybe_backup(AbsPath, true) ->
+%% 编辑前按需创建备份，附带 sessionId 便于会话级回滚。
+maybe_backup(AbsPath, true, Config) ->
     case filelib:is_file(AbsPath) of
-        true -> alBackup:backup_file(AbsPath, #{reason => <<"pre_edit"/utf8>>});
+        true ->
+            SessionId = maps:get(sessionId, Config, <<"default"/utf8>>),
+            Meta = #{reason => <<"pre_edit"/utf8>>, sessionId => toBinary(SessionId)},
+            alBackup:backup_file(AbsPath, Meta);
         false -> ok
     end;
-maybe_backup(_, _) -> ok.
+maybe_backup(_, _, _) -> ok.
 
 %% 异步触发代码索引刷新。
 maybe_reindex(Config) ->
-    alCodeIndexer:refresh_async(Config),
+    alCodeIndexer:refreshAsync(Config),
     ok.
 
 %% 从参数或文件头 -module 解析模块名。

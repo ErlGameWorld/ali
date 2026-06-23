@@ -6,7 +6,7 @@
 %%% 以及 Token 用量估算与统计。
 %%%
 %%% 配置通过 {@link application} 环境（ali 应用）读写，亦可由
-%%% {@link llmCliConfig} 从 config.cfg 加载。
+%%% {@link alConfig} 从 aliCfg.cfg 加载。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(llmCli).
@@ -27,7 +27,6 @@
     asyncChat/3,
     asyncChat/4,
     loadConfig/0,
-    loadConfigFromEnv/0,
     loadConfigFromFile/1,
     createSession/0,
     addToSession/2,
@@ -44,6 +43,10 @@
     createMessage/2,
     systemMessage/1,
     userMessage/1,
+    userMessage/2,
+    buildUserContent/2,
+    estimateContentTokens/1,
+    isContentParts/1,
     assistantMessage/1,
     toolMessage/2,
     assistantToolCallsMessage/1,
@@ -51,14 +54,23 @@
     chatCompletion/3,
     chatStreamTo/4,
     mergeStreamToolCallDelta/2,
-    finalizeStreamToolCalls/1
+    finalizeStreamToolCalls/1,
+    embeddings/2,
+    embeddings/3,
+    defaultEmbeddingModel/0,
+    defaultEmbeddingModel/1,
+    parseEmbeddingsResponse/2,
+    coalesceSystemMessages/1,
+    buildRequestBody/5,
+    supportsVision/2
 ]).
 
--type provider() :: openai | anthropic | deepseek | custom.
+-type provider() :: openai | anthropic | deepseek | custom
+                  | qwen | kimi | zhipu | ernie | doubao | openrouter | atom().
 -type model() :: binary() | string().
 -type message() :: #{
     role := system | user | assistant | tool,
-    content => binary() | string() | null,
+    content => binary() | string() | null | [map()],
     tool_call_id => binary() | string(),
     tool_calls => [map()]
 }.
@@ -89,7 +101,7 @@ stop() ->
 %%% 配置管理
 %%%===================================================================
 
-%% @doc 写入应用环境配置项（api_key、base_url、provider 等）。
+%% @doc 写入运行时 LLM 配置覆盖项（优先于 aliCfg.cfg）。
 -spec setConfig(configKey(), term()) -> ok.
 setConfig(Key, Value) ->
     application:set_env(ali, Key, Value).
@@ -97,7 +109,29 @@ setConfig(Key, Value) ->
 %% @doc 读取配置项；未设置时返回 undefined。
 -spec getConfig(configKey()) -> {ok, term()} | undefined.
 getConfig(Key) ->
-    application:get_env(ali, Key).
+    case application:get_env(ali, Key) of
+        {ok, Value} -> {ok, Value};
+        undefined ->
+            case aliCfg:getV(Key) of
+                undefined -> undefined;
+                V -> {ok, V}
+            end
+    end.
+
+%% @doc 一次性读取本次请求所需的常用配置（provider/api_key/base_url）。
+-spec requestConfig() -> #{provider => provider(), api_key => binary(), base_url => binary()}.
+requestConfig() ->
+    Resolved = alConfig:resolvedLlm(),
+    Provider = override(provider, maps:get(provider, Resolved)),
+    ApiKey = toBinary(override(api_key, maps:get(api_key, Resolved))),
+    BaseUrl = toBinary(override(base_url, maps:get(base_url, Resolved))),
+    #{provider => Provider, api_key => ApiKey, base_url => BaseUrl}.
+
+override(Key, Default) ->
+    case application:get_env(ali, Key) of
+        {ok, V} -> V;
+        undefined -> Default
+    end.
 
 %%%===================================================================
 %%% 同步聊天
@@ -111,10 +145,7 @@ chat(Model, Messages) ->
 %% @doc 发送聊天请求（可指定 temperature、max_tokens、tools 等选项）。
 -spec chat(model(), [message()], [option()]) -> {ok, binary()} | {error, term()}.
 chat(Model, Messages, Options) ->
-    Provider = getConfig(provider, openai),
-    ApiKey = getConfig(api_key, ""),
-    BaseUrl = getConfig(base_url, defaultUrl(Provider)),
-    
+    #{provider := Provider, api_key := ApiKey, base_url := BaseUrl} = requestConfig(),
     case ApiKey of
         "" -> {error, missing_api_key};
         <<>> -> {error, missing_api_key};
@@ -146,14 +177,15 @@ chatStream(Model, Messages) ->
 %% @doc 流式聊天（带选项）。
 -spec chatStream(model(), [message()], [option()]) -> ok | {error, term()}.
 chatStream(Model, Messages, Options) ->
-    Provider = getConfig(provider, openai),
-    ApiKey = getConfig(api_key, ""),
-    BaseUrl = getConfig(base_url, defaultUrl(Provider)),
-    
-    RequestBody = buildRequestBody(Model, Messages, Options, true, Provider),
-    Url = buildChatUrl(BaseUrl, Provider),
-    
-    streamRequest(post, Url, ApiKey, RequestBody, Provider).
+    #{provider := Provider, api_key := ApiKey, base_url := BaseUrl} = requestConfig(),
+    case ApiKey of
+        "" -> {error, missing_api_key};
+        <<>> -> {error, missing_api_key};
+        _ ->
+            RequestBody = buildRequestBody(Model, Messages, Options, true, Provider),
+            Url = buildChatUrl(BaseUrl, Provider),
+            streamRequest(post, Url, ApiKey, RequestBody, Provider)
+    end.
 
 %%%===================================================================
 %%% 聊天补全（含 tool_calls）
@@ -167,9 +199,7 @@ chatCompletion(Model, Messages) ->
 %% @doc 聊天补全（带选项）。
 -spec chatCompletion(model(), [message()], [option()]) -> {ok, map()} | {error, term()}.
 chatCompletion(Model, Messages, Options) ->
-    Provider = getConfig(provider, openai),
-    ApiKey = getConfig(api_key, ""),
-    BaseUrl = getConfig(base_url, defaultUrl(Provider)),
+    #{provider := Provider, api_key := ApiKey, base_url := BaseUrl} = requestConfig(),
     case ApiKey of
         "" -> {error, missing_api_key};
         <<>> -> {error, missing_api_key};
@@ -193,17 +223,114 @@ chatCompletion(Model, Messages, Options) ->
 %% @doc 流式聊天并将分块发往指定进程（而非 self()）。
 -spec chatStreamTo(model(), [message()], [option()], pid()) -> ok | {error, term()}.
 chatStreamTo(Model, Messages, Options, TargetPid) ->
+    #{provider := Provider, api_key := ApiKey, base_url := BaseUrl} = requestConfig(),
+    case ApiKey of
+        "" -> {error, missing_api_key};
+        <<>> -> {error, missing_api_key};
+        _ ->
+            RequestBody = buildRequestBody(Model, Messages, Options, true, Provider),
+            Url = buildChatUrl(BaseUrl, Provider),
+            streamRequestTo(post, Url, ApiKey, RequestBody, Provider, TargetPid)
+    end.
+
+%%%===================================================================
+%%% 向量嵌入（Embeddings）
+%%%===================================================================
+
+%% @doc 获取文本（或文本列表）的向量嵌入，使用配置的默认 embedding 模型。
+%% 单条文本返回 `{ok, Vector}'，多条文本返回 `{ok, [Vector]}'。
+-spec embeddings(binary() | string() | [binary() | string()], map()) ->
+    {ok, [number()]} | {ok, [[number()]]} | {error, term()}.
+embeddings(Input, Opts) ->
+    Model = case maps:get(model, Opts, undefined) of
+        undefined -> defaultEmbeddingModel();
+        M -> M
+    end,
+    embeddings(Model, Input, Opts).
+
+%% @doc 获取向量嵌入，指定模型。
+%% Anthropic 无独立 embeddings API，返回 `{error, unsupported}'。
+-spec embeddings(model(), binary() | string() | [binary() | string()], map()) ->
+    {ok, [number()]} | {ok, [[number()]]} | {error, term()}.
+embeddings(Model, Input, Opts) ->
+    #{provider := Provider, api_key := ApiKey, base_url := BaseUrl} = requestConfig(),
+    case {Provider, ApiKey} of
+        {anthropic, _} ->
+            {error, unsupported};
+        {_, ""} ->
+            {error, missing_api_key};
+        {_, <<>>} ->
+            {error, missing_api_key};
+        {_, _} ->
+            Url = buildEmbeddingsUrl(BaseUrl, Provider),
+            Body = buildEmbeddingsBody(Model, Input, Opts, Provider),
+            case makeRequest(post, Url, ApiKey, Body, Provider) of
+                {ok, ResponseBody} ->
+                    parseEmbeddingsResponse(ResponseBody, is_list(Input));
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% @doc 当前 provider 的默认 embedding 模型。
+-spec defaultEmbeddingModel() -> binary().
+defaultEmbeddingModel() ->
     Provider = getConfig(provider, openai),
-    ApiKey = getConfig(api_key, ""),
-    BaseUrl = getConfig(base_url, defaultUrl(Provider)),
-    RequestBody = buildRequestBody(Model, Messages, Options, true, Provider),
-    Url = buildChatUrl(BaseUrl, Provider),
-    streamRequestTo(post, Url, ApiKey, RequestBody, Provider, TargetPid).
+    defaultEmbeddingModel(Provider).
+
+%% @doc 按 provider 返回默认 embedding 模型。
+-spec defaultEmbeddingModel(provider()) -> binary().
+defaultEmbeddingModel(openai) -> <<"text-embedding-3-small"/utf8>>;
+defaultEmbeddingModel(deepseek) -> <<"deepseek-embedding"/utf8>>;
+defaultEmbeddingModel(qwen) -> <<"text-embedding-v3"/utf8>>;
+defaultEmbeddingModel(zhipu) -> <<"embedding-3"/utf8>>;
+defaultEmbeddingModel(ernie) -> <<"embedding-v1"/utf8>>;
+defaultEmbeddingModel(doubao) -> <<"doubao-embedding-text-240715"/utf8>>;
+defaultEmbeddingModel(openrouter) -> <<"openai/text-embedding-3-small"/utf8>>;
+defaultEmbeddingModel(kimi) -> <<"text-embedding-3-small"/utf8>>;
+defaultEmbeddingModel(_) -> <<"text-embedding-3-small"/utf8>>.
+
+%% 拼接 embeddings 接口 URL（OpenAI 兼容 provider 均为 /embeddings）。
+-spec buildEmbeddingsUrl(binary(), provider()) -> binary().
+buildEmbeddingsUrl(BaseUrl, _Provider) ->
+    <<(toBinary(BaseUrl))/binary, "/embeddings"/utf8>>.
+
+%% 构建 embeddings 请求体。
+buildEmbeddingsBody(Model, Input, Opts, _Provider) when is_list(Input), not is_binary(Input) ->
+    Base = #{
+        <<"model"/utf8>> => toBinary(Model),
+        <<"input"/utf8>> => [toBinary(I) || I <- Input]
+    },
+    maybeEncodingFormat(Base, Opts);
+buildEmbeddingsBody(Model, Input, Opts, _Provider) ->
+    Base = #{
+        <<"model"/utf8>> => toBinary(Model),
+        <<"input"/utf8>> => toBinary(Input)
+    },
+    maybeEncodingFormat(Base, Opts).
+
+%% 仅在非默认 float 时附加 encoding_format 字段。
+maybeEncodingFormat(Base, Opts) ->
+    case maps:get(encodingFormat, Opts, <<"float"/utf8>>) of
+        <<"float"/utf8>> -> Base;
+        F -> Base#{<<"encoding_format"/utf8>> => F}
+    end.
+
+%% 解析 embeddings 响应：单条返回向量，多条返回向量列表。
+parseEmbeddingsResponse(ResponseBody, IsList) ->
+    case ResponseBody of
+        #{<<"data"/utf8>> := [#{<<"embedding"/utf8>> := _Vec} | _] = Items} when IsList ->
+            {ok, [maps:get(<<"embedding"/utf8>>, I) || I <- Items]};
+        #{<<"data"/utf8>> := [#{<<"embedding"/utf8>> := Vec} | _]} ->
+            {ok, Vec};
+        _ ->
+            {error, invalid_response}
+    end.
 
 %% @doc 读取配置项；未设置时返回 Default。
 -spec getConfig(configKey(), term()) -> term().
 getConfig(Key, Default) ->
-    case application:get_env(ali, Key) of
+    case getConfig(Key) of
         {ok, Value} -> Value;
         undefined -> Default
     end.
@@ -221,29 +348,110 @@ defaultUrl(deepseek) ->
 defaultUrl(anthropic) ->
     <<"https://api.anthropic.com/v1"/utf8>>;
 defaultUrl(custom) ->
+    <<>>;
+defaultUrl(_Provider) ->
+    %% 其它 OpenAI 兼容 provider 由配置/预设提供 base_url
     <<>>.
 
 %% @doc 拼接聊天接口完整 URL（Anthropic 使用 /messages，其余为 /chat/completions）。
 -spec buildChatUrl(binary(), provider()) -> binary().
 buildChatUrl(BaseUrl, Provider) ->
+    BinUrl = toBinary(BaseUrl),
     Endpoint = case Provider of
         anthropic -> <<"/messages"/utf8>>;
         _ -> <<"/chat/completions"/utf8>>
     end,
-    <<BaseUrl/binary, Endpoint/binary>>.
+    <<BinUrl/binary, Endpoint/binary>>.
+
+-define(MAX_API_CONTENT_BYTES, 16000).
 
 %% @doc 构建 JSON 请求体（model、messages、stream 及可选参数）。
 -spec buildRequestBody(model(), [message()], [option()], boolean(), provider()) -> map().
 buildRequestBody(Model, Messages, Options, Stream, anthropic) ->
     buildAnthropicRequestBody(Model, Messages, Options, Stream);
-buildRequestBody(Model, Messages, Options, Stream, _Provider) ->
-    Base = #{
+buildRequestBody(Model, Messages, Options, Stream, Provider) ->
+    Coalesced = coalesceSystemMessages(Messages),
+    Sanitized = sanitizeMessagesForVision(Coalesced, Provider, Model),
+    OptionsMap = normalizeRequestOptions(Options),
+    Core = #{
         <<"model"/utf8>> => toBinary(Model),
-        <<"messages"/utf8>> => [formatMessage(M) || M <- Messages],
+        <<"messages"/utf8>> => [formatMessage(M) || M <- Sanitized],
         <<"stream"/utf8>> => Stream
     },
-    OptionsMap = maps:from_list(Options),
-    maps:merge(Base, OptionsMap).
+    maps:merge(OptionsMap, Core).
+
+%% @doc 当前 provider + model 是否支持 image_url / file 等多模态 content parts。
+%% 可通过应用配置 `{visionEnabled, true | false}` 强制覆盖。
+-spec supportsVision(provider(), model()) -> boolean().
+supportsVision(Provider, Model) ->
+    case getConfig(visionEnabled, undefined) of
+        undefined ->
+            supportsVisionDefault(Provider, Model);
+        Enabled when is_boolean(Enabled) ->
+            Enabled
+    end.
+
+supportsVisionDefault(anthropic, _Model) ->
+    true;
+supportsVisionDefault(deepseek, _Model) ->
+    false;
+supportsVisionDefault(openai, Model) ->
+    openaiVisionModel(Model);
+supportsVisionDefault(custom, Model) ->
+    openaiVisionModel(Model);
+supportsVisionDefault(_Provider, _Model) ->
+    false.
+
+openaiVisionModel(Model) ->
+    M = string:lowercase(binary_to_list(toBinary(Model))),
+    VisionPrefixes = [
+        "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision",
+        "chatgpt-4o", "o1", "o3", "o4"
+    ],
+    lists:any(
+        fun(Prefix) ->
+            case string:prefix(M, Prefix) of
+                nomatch -> false;
+                _ -> true
+            end
+        end,
+        VisionPrefixes
+    ).
+
+sanitizeMessagesForVision(Messages, Provider, Model) ->
+    case supportsVision(Provider, Model) of
+        true ->
+            Messages;
+        false ->
+            [downgradeMultimodalMessage(M) || M <- Messages]
+    end.
+
+downgradeMultimodalMessage(#{role := user, content := Content} = Msg) when is_list(Content) ->
+    case isContentParts(Content) of
+        true ->
+            Msg#{content := [downgradeMultimodalPart(P) || P <- Content]};
+        false ->
+            Msg
+    end;
+downgradeMultimodalMessage(Msg) ->
+    Msg.
+
+downgradeMultimodalPart(#{<<"type"/utf8>> := <<"image_url"/utf8>>}) ->
+    #{
+        <<"type"/utf8>> => <<"text"/utf8>>,
+        <<"text"/utf8>> =>
+            <<"[用户上传了图片，但当前模型不支持图像识别，无法查看图片内容。"
+              "请建议用户切换到支持视觉的模型（如 gpt-4o）。]"/utf8>>
+    };
+downgradeMultimodalPart(#{<<"type"/utf8>> := <<"file"/utf8>>}) ->
+    #{
+        <<"type"/utf8>> => <<"text"/utf8>>,
+        <<"text"/utf8>> =>
+            <<"[用户上传了文档附件，但当前模型不支持此格式，无法读取文档内容。"
+              "请建议用户切换到支持多模态的模型（如 gpt-4o）。]"/utf8>>
+    };
+downgradeMultimodalPart(Part) ->
+    Part.
 
 %% Anthropic Messages API 请求体（system 独立字段，tools 格式不同）。
 buildAnthropicRequestBody(Model, Messages, Options, Stream) ->
@@ -332,7 +540,10 @@ convertMessagesForAnthropic([#{role := assistant} = Msg | Rest], Acc) ->
     },
     convertMessagesForAnthropic(Rest, [AnthropicMsg | Acc]);
 convertMessagesForAnthropic([#{role := user, content := Content} | Rest], Acc) ->
-    Msg = #{<<"role"/utf8>> => <<"user"/utf8>>, <<"content"/utf8>> => toBinary(Content)},
+    Msg = #{
+        <<"role"/utf8>> => <<"user"/utf8>>,
+        <<"content"/utf8>> => userContentForAnthropic(Content)
+    },
     convertMessagesForAnthropic(Rest, [Msg | Acc]);
 convertMessagesForAnthropic([_ | Rest], Acc) ->
     convertMessagesForAnthropic(Rest, Acc).
@@ -398,27 +609,70 @@ buildRequestHeaders(_Provider, ApiKey) ->
 
 %% @doc 将内部 message 映射转为 API 所需的 JSON 结构。
 -spec formatMessage(message()) -> map().
-formatMessage(#{role := tool, tool_call_id := Id, content := Content}) ->
-    #{
-        <<"role"/utf8>> => <<"tool"/utf8>>,
-        <<"tool_call_id"/utf8>> => toBinary(Id),
-        <<"content"/utf8>> => toBinary(Content)
-    };
 formatMessage(#{role := assistant, tool_calls := Calls} = Msg) ->
     Content = maps:get(content, Msg, null),
     #{
         <<"role"/utf8>> => <<"assistant"/utf8>>,
-        <<"content"/utf8>> => formatContent(Content),
-        <<"tool_calls"/utf8>> => Calls
+        <<"content"/utf8>> => capApiContent(formatContent(Content)),
+        <<"tool_calls"/utf8>> => sanitizeToolCalls(Calls)
+    };
+formatMessage(#{role := tool, tool_call_id := Id, content := Content}) ->
+    #{
+        <<"role"/utf8>> => <<"tool"/utf8>>,
+        <<"tool_call_id"/utf8>> => toBinary(Id),
+        <<"content"/utf8>> => capApiContent(toBinary(Content))
     };
 formatMessage(#{role := Role, content := Content}) ->
     #{
         <<"role"/utf8>> => atomToBinary(Role),
-        <<"content"/utf8>> => formatContent(Content)
+        <<"content"/utf8>> => capApiContent(formatContent(Content))
     }.
+
+sanitizeToolCalls(Calls) when is_list(Calls) ->
+    [sanitizeToolCall(C) || C <- Calls];
+sanitizeToolCalls(Calls) ->
+    Calls.
+
+sanitizeToolCall(#{<<"function"/utf8>> := Fun} = Call) ->
+    Args = maps:get(<<"arguments"/utf8>>, Fun, <<>>),
+    Fun1 = maps:put(<<"arguments"/utf8>>, capApiContent(toBinary(Args)), Fun),
+    maps:put(<<"function"/utf8>>, Fun1, Call);
+sanitizeToolCall(Call) ->
+    Call.
+
+capApiContent(null) ->
+    null;
+capApiContent(Bin) when is_binary(Bin) ->
+    capBinary(Bin, ?MAX_API_CONTENT_BYTES);
+capApiContent(Parts) when is_list(Parts) ->
+    case isContentParts(Parts) of
+        true ->
+            [capContentPart(P) || P <- Parts];
+        false ->
+            capBinary(toBinary(Parts), ?MAX_API_CONTENT_BYTES)
+    end;
+capApiContent(Other) ->
+    capBinary(toBinary(Other), ?MAX_API_CONTENT_BYTES).
+
+capContentPart(#{<<"type"/utf8>> := <<"text"/utf8>>, <<"text"/utf8>> := Text} = Part) ->
+    Part#{<<"text"/utf8>> => capBinary(toBinary(Text), ?MAX_API_CONTENT_BYTES)};
+capContentPart(Part) ->
+    Part.
+
+capBinary(Bin, Max) when byte_size(Bin) =< Max ->
+    Bin;
+capBinary(Bin, Max) ->
+    Base = binary:part(Bin, 0, Max),
+    Safe = llmJson:sanitize_binary(Base),
+    <<Safe/binary, <<"\n...[content truncated for API]"/utf8>>/binary>>.
 
 %% 将 content 字段格式化为 API 可接受的值（null 或二进制）。
 formatContent(null) -> null;
+formatContent(Content) when is_list(Content) ->
+    case isContentParts(Content) of
+        true -> Content;
+        false -> toBinary(Content)
+    end;
 formatContent(Content) -> toBinary(Content).
 
 %% 将 API 返回的 content 规范化为二进制文本（支持多段 content parts）。
@@ -475,15 +729,27 @@ httpOpts() ->
     {ok, map()} | {error, term()}.
 makeRequest(Method, Url, ApiKey, Body, Provider) ->
     Headers = buildRequestHeaders(Provider, ApiKey),
-
-    case hackney:request(Method, Url, Headers, llmJson:encode(Body), httpOpts()) of
-        {ok, 200, _, ResponseBody} ->
-            {ok, llmJson:decode(ResponseBody)};
-        {ok, StatusCode, _, ErrorBody} ->
-            {error, {http_error, StatusCode, llmJson:decode(ErrorBody)}};
+    case encodeRequestBody(Body) of
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason};
+        {ok, JsonBody} ->
+            case hackney:request(Method, Url, Headers, JsonBody, httpOpts()) of
+                {ok, 200, _, ResponseBody} ->
+                    try
+                        {ok, llmJson:decode(ResponseBody)}
+                    catch
+                        _:_ ->
+                            {error, invalidJson}
+                    end;
+                {ok, StatusCode, _, ErrorBody} ->
+                    {error, {http_error, StatusCode, decodeErrorBody(ErrorBody)}};
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.
+
+encodeRequestBody(Body) ->
+    llmJson:encodeStrict(Body).
 
 %% @doc 流式请求入口；分块发往 self()。
 -spec streamRequest(atom(), binary(), binary() | string(), map(), provider()) -> ok | {error, term()}.
@@ -495,25 +761,29 @@ streamRequest(Method, Url, ApiKey, Body, Provider) ->
     ok | {error, term()}.
 streamRequestTo(Method, Url, ApiKey, Body, Provider, TargetPid) ->
     Headers = buildRequestHeaders(Provider, ApiKey),
-    case hackney:request(Method, Url, Headers, llmJson:encode(Body),
-                         [{protocols, [http1]}, {async, once}, {stream_to, TargetPid} | httpOpts()]) of
-        {ok, ClientRef} ->
-            streamLoopTo(ClientRef, Provider, TargetPid);
+    case encodeRequestBody(Body) of
         {error, Reason} ->
-            {error, Reason}
+            {error, Reason};
+        {ok, JsonBody} ->
+            case hackney:request(Method, Url, Headers, JsonBody,
+                                 [{protocols, [http1]}, {async, once}, {stream_to, TargetPid} | httpOpts()]) of
+                {ok, ClientRef} ->
+                    streamLoopTo(ClientRef, Provider, TargetPid);
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.
 
 %% 流式响应接收循环：解析 SSE 数据块并转发，含超时保护。
 streamLoopTo(ClientRef, Provider, TargetPid) ->
     receive
         {hackney_response, ClientRef, {error, Reason}} ->
-            catch hackney:close(ClientRef),
+            quiet_close(ClientRef),
             TargetPid ! {al, streamError, Reason},
             {error, Reason};
         {hackney_response, ClientRef, {status, StatusCode, _}} when StatusCode >= 400 ->
-            catch hackney:close(ClientRef),
-            TargetPid ! {al, streamError, {http_error, StatusCode}},
-            {error, {http_error, StatusCode}};
+            hackney:stream_next(ClientRef),
+            streamErrorBodyTo(ClientRef, TargetPid, StatusCode, <<>>);
         {hackney_response, ClientRef, {status, _StatusCode, _Reason}} ->
             hackney:stream_next(ClientRef),
             streamLoopTo(ClientRef, Provider, TargetPid);
@@ -521,11 +791,11 @@ streamLoopTo(ClientRef, Provider, TargetPid) ->
             hackney:stream_next(ClientRef),
             streamLoopTo(ClientRef, Provider, TargetPid);
         {hackney_response, ClientRef, done} ->
-            catch hackney:close(ClientRef),
+            quiet_close(ClientRef),
             sendStreamDone(TargetPid),
             ok;
         {hackney_response, ClientRef, <<>>} ->
-            catch hackney:close(ClientRef),
+            quiet_close(ClientRef),
             sendStreamDone(TargetPid),
             ok;
         {hackney_response, ClientRef, Data} ->
@@ -536,7 +806,7 @@ streamLoopTo(ClientRef, Provider, TargetPid) ->
                     streamLoopTo(ClientRef, Provider, TargetPid);
                 {done, Events} ->
                     lists:foreach(fun(Ev) -> dispatchStreamEvent(TargetPid, Ev) end, Events),
-                    catch hackney:close(ClientRef),
+                    quiet_close(ClientRef),
                     sendStreamDone(TargetPid),
                     ok;
                 ignore ->
@@ -545,11 +815,88 @@ streamLoopTo(ClientRef, Provider, TargetPid) ->
             end
     after ?STREAM_IDLE_TIMEOUT ->
         %% 流式响应超时：连接 stall，通知调用方并清理
-        catch hackney:close(ClientRef),
+        quiet_close(ClientRef),
         TargetPid ! {al, streamError, stream_timeout},
         TargetPid ! {al, streamDone, done},
         {error, stream_timeout}
     end.
+
+streamErrorBodyTo(ClientRef, TargetPid, StatusCode, Acc) ->
+    receive
+        {hackney_response, ClientRef, done} ->
+            quiet_close(ClientRef),
+            Err = {http_error, StatusCode, decodeErrorBody(Acc)},
+            TargetPid ! {al, streamError, Err},
+            {error, Err};
+        {hackney_response, ClientRef, <<>>} ->
+            quiet_close(ClientRef),
+            Err = {http_error, StatusCode, decodeErrorBody(Acc)},
+            TargetPid ! {al, streamError, Err},
+            {error, Err};
+        {hackney_response, ClientRef, Data} when is_binary(Data) ->
+            hackney:stream_next(ClientRef),
+            streamErrorBodyTo(ClientRef, TargetPid, StatusCode, <<Acc/binary, Data/binary>>);
+        {hackney_response, ClientRef, {error, Reason}} ->
+            quiet_close(ClientRef),
+            Err = {http_error, StatusCode, decodeErrorBody(Acc)},
+            TargetPid ! {al, streamError, Err},
+            {error, Reason}
+    after ?STREAM_IDLE_TIMEOUT ->
+        quiet_close(ClientRef),
+        Err = {http_error, StatusCode, decodeErrorBody(Acc)},
+        TargetPid ! {al, streamError, Err},
+        {error, Err}
+    end.
+
+decodeErrorBody(<<>>) ->
+    #{};
+decodeErrorBody(Bin) ->
+    try llmJson:decode(Bin) catch _:_ -> #{<<"raw"/utf8>> => Bin} end.
+
+%% 合并开头连续的 system 消息（多数 OpenAI 兼容 API 只接受一条）。
+-spec coalesceSystemMessages([message()]) -> [message()].
+coalesceSystemMessages(Messages) ->
+    case takeLeadingSystems(Messages, []) of
+        {[], Rest} ->
+            Rest;
+        {Systems, Rest} ->
+            [mergeSystemMessages(Systems) | Rest]
+    end.
+
+takeLeadingSystems([#{role := system} = M | T], Acc) ->
+    takeLeadingSystems(T, [M | Acc]);
+takeLeadingSystems(Rest, Acc) ->
+    {lists:reverse(Acc), Rest}.
+
+mergeSystemMessages(Systems) ->
+    Parts = [systemMessageText(M) || M <- Systems],
+    NonEmpty = [P || P <- Parts, P =/= <<>>],
+    Content = case NonEmpty of
+        [] -> <<>>;
+        _ -> iolist_to_binary(lists:join(<<"\n\n"/utf8>>, NonEmpty))
+    end,
+    #{role => system, content => Content}.
+
+systemMessageText(#{content := Content}) ->
+    toBinary(Content);
+systemMessageText(_) ->
+    <<>>.
+
+normalizeRequestOptions(Options) when is_map(Options) ->
+    maps:fold(fun(K, V, Acc) ->
+        maps:put(normalizeOptionKey(K), V, Acc)
+    end, #{}, Options);
+normalizeRequestOptions(Options) when is_list(Options) ->
+    normalizeRequestOptions(maps:from_list(Options)).
+
+normalizeOptionKey(K) when is_binary(K) -> K;
+normalizeOptionKey(tools) -> <<"tools"/utf8>>;
+normalizeOptionKey(tool_choice) -> <<"tool_choice"/utf8>>;
+normalizeOptionKey(temperature) -> <<"temperature"/utf8>>;
+normalizeOptionKey(max_tokens) -> <<"max_tokens"/utf8>>;
+normalizeOptionKey(top_p) -> <<"top_p"/utf8>>;
+normalizeOptionKey(K) when is_atom(K) -> atom_to_binary(K, utf8);
+normalizeOptionKey(K) -> toBinary(K).
 
 %% 向目标进程发送流式文本块（兼容两种消息格式）。
 sendStreamChunk(Pid, Chunk) ->
@@ -565,6 +912,10 @@ dispatchStreamEvent(Pid, {tool_delta, Delta}) ->
     sendStreamToolDelta(Pid, Delta);
 dispatchStreamEvent(_Pid, done) ->
     ok.
+
+%% 静默关闭 hackney 连接（清理路径，失败忽略）。
+quiet_close(Ref) ->
+    try hackney:close(Ref) catch _:_ -> ok end.
 
 %% 通知目标进程流式传输结束。
 sendStreamDone(Pid) ->
@@ -625,7 +976,7 @@ extractStreamEvents(Decoded, Provider) ->
     end.
 
 extractStreamToolDelta(#{<<"choices"/utf8>> := [#{<<"delta"/utf8>> := Delta}]}, Provider)
-        when Provider =:= openai; Provider =:= deepseek; Provider =:= custom ->
+        when Provider =/= anthropic ->
     case maps:get(<<"tool_calls"/utf8>>, Delta, undefined) of
         Calls when is_list(Calls), Calls =/= [] -> {tool_delta, Calls};
         _ -> ignore
@@ -681,7 +1032,7 @@ finalizeStreamToolCalls(Acc) ->
 %% @doc 从流式 JSON 的 delta 字段提取文本增量。
 -spec extractStreamContent(map(), provider()) -> {ok, binary()} | {tool_delta, [map()]} | ignore.
 extractStreamContent(#{<<"choices"/utf8>> := [#{<<"delta"/utf8>> := Delta}]}, Provider)
-        when Provider =:= openai; Provider =:= deepseek; Provider =:= custom ->
+        when Provider =/= anthropic ->
     case maps:get(<<"tool_calls"/utf8>>, Delta, undefined) of
         Calls when is_list(Calls), Calls =/= [] ->
             {tool_delta, Calls};
@@ -706,7 +1057,7 @@ extractStreamContent(_, _) ->
 %% @doc 解析非流式聊天响应，提取助手回复文本。
 -spec parseChatResponse(map(), provider()) -> {ok, binary()} | {error, term()}.
 parseChatResponse(Response, Provider)
-        when Provider =:= openai; Provider =:= deepseek; Provider =:= custom ->
+        when Provider =/= anthropic ->
     case Response of
         #{<<"choices"/utf8>> := [#{<<"message"/utf8>> := Message} | _]} ->
             {ok, normalizeApiContent(maps:get(<<"content"/utf8>>, Message, <<>>))};
@@ -729,7 +1080,7 @@ parseChatResponse(Response, anthropic) ->
 %% 解析补全响应：区分普通回答与 tool_calls。
 -spec parseCompletion(map(), provider()) -> {ok, map()} | {error, term()}.
 parseCompletion(Response, Provider)
-        when Provider =:= openai; Provider =:= deepseek; Provider =:= custom ->
+        when Provider =/= anthropic ->
     case Response of
         #{<<"choices"/utf8>> := [#{<<"message"/utf8>> := Message} | _]} ->
             case maps:get(<<"tool_calls"/utf8>>, Message, undefined) of
@@ -838,7 +1189,7 @@ listToBinary(L) -> unicode:characters_to_binary(L).
 
 %% 原子转二进制。
 -spec atomToBinary(atom()) -> binary().
-atomToBinary(A) -> atom_to_binary(A).
+atomToBinary(A) -> atom_to_binary(A, utf8).
 
 %% 整数转二进制。
 -spec integerToBinary(integer()) -> binary().
@@ -853,9 +1204,14 @@ floatToBinary(F, Opts) -> float_to_binary(F, Opts).
 %%%===================================================================
 
 %% @doc 创建指定角色的聊天消息。
--spec createMessage(atom(), binary() | string()) -> message().
+-spec createMessage(atom(), binary() | string() | [map()]) -> message().
 createMessage(Role, Content) when is_list(Content) ->
-    #{role => Role, content => listToBinary(Content)};
+    case isContentParts(Content) of
+        true ->
+            #{role => Role, content => Content};
+        false ->
+            #{role => Role, content => listToBinary(Content)}
+    end;
 createMessage(Role, Content) ->
     #{role => Role, content => Content}.
 
@@ -864,10 +1220,177 @@ createMessage(Role, Content) ->
 systemMessage(Content) ->
     createMessage(system, Content).
 
-%% @doc 创建 user 角色消息。
+%% @doc 创建 user 角色消息（纯文本）。
 -spec userMessage(binary() | string()) -> message().
 userMessage(Content) ->
     createMessage(user, Content).
+
+%% @doc 创建 user 角色消息（可含图片与文本文件附件）。
+%% Attachments 为 `#{images => [...], files => [...]}`。
+-spec userMessage(binary() | string(), map()) -> message().
+userMessage(Content, Attachments) when is_map(Attachments) ->
+    createMessage(user, buildUserContent(Content, Attachments)).
+
+%% @doc 构建 user 消息的 content（binary 或 OpenAI content parts 列表）。
+-spec buildUserContent(binary(), map()) -> binary() | [map()].
+buildUserContent(Prompt, Attachments) when is_map(Attachments) ->
+    Images = maps:get(images, Attachments, []),
+    Files = maps:get(files, Attachments, []),
+    Documents = maps:get(documents, Attachments, []),
+    case Images =:= [] andalso Files =:= [] andalso Documents =:= [] of
+        true ->
+            Prompt;
+        false ->
+            buildUserContentParts(Prompt, Images, Files, Documents)
+    end.
+
+buildUserContentParts(Prompt, Images, Files, Documents) ->
+    TextParts = case Prompt of
+        <<>> -> [];
+        _ -> [#{<<"type"/utf8>> => <<"text"/utf8>>, <<"text"/utf8>> => Prompt}]
+    end,
+    FileParts = [fileAttachmentPart(F) || F <- Files],
+    DocParts = [documentAttachmentPart(D) || D <- Documents],
+    ImageParts = [imageAttachmentPart(I) || I <- Images],
+    TextParts ++ FileParts ++ DocParts ++ ImageParts.
+
+fileAttachmentPart(#{<<"name"/utf8>> := Name, <<"data"/utf8>> := Data}) ->
+    Header = iolist_to_binary([<<"[附件: "/utf8>>, Name, <<"]\n```\n"/utf8>>]),
+    Footer = <<"\n```"/utf8>>,
+    #{
+        <<"type"/utf8>> => <<"text"/utf8>>,
+        <<"text"/utf8>> => <<Header/binary, Data/binary, Footer/binary>>
+    };
+fileAttachmentPart(#{name := Name, data := Data}) ->
+    fileAttachmentPart(#{
+        <<"name"/utf8>> => toBinary(Name),
+        <<"data"/utf8>> => toBinary(Data)
+    }).
+
+documentAttachmentPart(#{<<"name"/utf8>> := Name, <<"mediaType"/utf8>> := MT, <<"data"/utf8>> := Data}) ->
+    B64 = stripBase64Data(Data),
+    FileData = iolist_to_binary([<<"data:"/utf8>>, MT, <<";base64,"/utf8>>, B64]),
+    #{
+        <<"type"/utf8>> => <<"file"/utf8>>,
+        <<"file"/utf8>> => #{
+            <<"filename"/utf8>> => Name,
+            <<"file_data"/utf8>> => FileData
+        }
+    };
+documentAttachmentPart(#{name := Name, mediaType := MT, data := Data}) ->
+    documentAttachmentPart(#{
+        <<"name"/utf8>> => toBinary(Name),
+        <<"mediaType"/utf8>> => toBinary(MT),
+        <<"data"/utf8>> => toBinary(Data)
+    }).
+
+imageAttachmentPart(#{<<"mediaType"/utf8>> := MT, <<"data"/utf8>> := Data}) ->
+    B64 = stripBase64Data(Data),
+    Url = iolist_to_binary([<<"data:"/utf8>>, MT, <<";base64,"/utf8>>, B64]),
+    #{
+        <<"type"/utf8>> => <<"image_url"/utf8>>,
+        <<"image_url"/utf8>> => #{
+            <<"url"/utf8>> => Url,
+            <<"detail"/utf8>> => <<"auto"/utf8>>
+        }
+    };
+imageAttachmentPart(#{mediaType := MT, data := Data}) ->
+    imageAttachmentPart(#{
+        <<"mediaType"/utf8>> => toBinary(MT),
+        <<"data"/utf8>> => toBinary(Data)
+    }).
+
+stripBase64Data(Bin) when is_binary(Bin) ->
+    case binary:split(Bin, <<";base64,">>) of
+        [_Prefix, Data] -> Data;
+        _ -> Bin
+    end;
+stripBase64Data(Bin) when is_list(Bin) ->
+    stripBase64Data(list_to_binary(Bin));
+stripBase64Data(_) ->
+    <<>>.
+
+userContentForAnthropic(Bin) when is_binary(Bin) ->
+    Bin;
+userContentForAnthropic(Parts) when is_list(Parts) ->
+    case isContentParts(Parts) of
+        true -> [convertUserPartForAnthropic(P) || P <- Parts];
+        false -> toBinary(Parts)
+    end;
+userContentForAnthropic(Other) ->
+    toBinary(Other).
+
+convertUserPartForAnthropic(#{<<"type"/utf8>> := <<"text"/utf8>>, <<"text"/utf8>> := Text}) ->
+    #{<<"type"/utf8>> => <<"text"/utf8>>, <<"text"/utf8>> => Text};
+convertUserPartForAnthropic(#{<<"type"/utf8>> := <<"file"/utf8>>, <<"file"/utf8>> := File}) ->
+    Filename = maps:get(<<"filename"/utf8>>, File, <<"file"/utf8>>),
+    FileData = maps:get(<<"file_data"/utf8>>, File, <<>>),
+    case parseDataUrl(FileData) of
+        {ok, MT, B64} ->
+            #{
+                <<"type"/utf8>> => <<"document"/utf8>>,
+                <<"source"/utf8>> => #{
+                    <<"type"/utf8>> => <<"base64"/utf8>>,
+                    <<"media_type"/utf8>> => MT,
+                    <<"data"/utf8>> => B64
+                }
+            };
+        error ->
+            #{
+                <<"type"/utf8>> => <<"text"/utf8>>,
+                <<"text"/utf8>> => iolist_to_binary([<<"[附件: "/utf8>>, Filename, <<"]"/utf8>>])
+            }
+    end;
+convertUserPartForAnthropic(#{<<"type"/utf8>> := <<"image_url"/utf8>>, <<"image_url"/utf8>> := Img}) ->
+    Url = maps:get(<<"url"/utf8>>, Img, <<>>),
+    case parseDataUrl(Url) of
+        {ok, MT, B64} ->
+            #{
+                <<"type"/utf8>> => <<"image"/utf8>>,
+                <<"source"/utf8>> => #{
+                    <<"type"/utf8>> => <<"base64"/utf8>>,
+                    <<"media_type"/utf8>> => MT,
+                    <<"data"/utf8>> => B64
+                }
+            };
+        error ->
+            #{<<"type"/utf8>> => <<"text"/utf8>>, <<"text"/utf8>> => Url}
+    end;
+convertUserPartForAnthropic(Part) ->
+    #{<<"type"/utf8>> => <<"text"/utf8>>, <<"text"/utf8>> => toBinary(Part)}.
+
+parseDataUrl(<<"data:", Rest/binary>>) ->
+    case binary:split(Rest, <<";base64,">>) of
+        [MT, Data] -> {ok, MT, Data};
+        _ -> error
+    end;
+parseDataUrl(_) ->
+    error.
+
+%% @doc 估算 message content 的 token 数（含多模态 parts）。
+-spec estimateContentTokens(term()) -> non_neg_integer().
+estimateContentTokens(Content) when is_binary(Content) ->
+    estimateTokens(Content);
+estimateContentTokens(Parts) when is_list(Parts) ->
+    case isContentParts(Parts) of
+        true ->
+            lists:sum([partTokenEstimate(P) || P <- Parts]);
+        false ->
+            estimateTokens(toBinary(Parts))
+    end;
+estimateContentTokens(null) ->
+    0;
+estimateContentTokens(Other) ->
+    estimateTokens(toBinary(Other)).
+
+partTokenEstimate(#{<<"type"/utf8>> := <<"image_url"/utf8>>}) ->
+    765;
+partTokenEstimate(#{<<"type"/utf8>> := <<"file"/utf8>>}) ->
+    2000;
+partTokenEstimate(#{<<"type"/utf8>> := <<"text"/utf8>>, <<"text"/utf8>> := Text}) ->
+    estimateTokens(Text);
+partTokenEstimate(_) ->
+    1.
 
 %% @doc 创建 assistant 角色消息。
 -spec assistantMessage(binary() | string()) -> message().
@@ -960,36 +1483,15 @@ asyncChat(Model, Messages, Options, CallbackPid) ->
 %%% 配置加载
 %%%===================================================================
 
-%% @doc 从默认配置文件加载（config.cfg 或 LLM_CONFIG_FILE）。
+%% @doc 从默认路径加载 aliCfg.cfg。
 -spec loadConfig() -> ok | {error, term()}.
 loadConfig() ->
-    llmCliConfig:load().
-
-%% @doc 从环境变量 LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL 覆盖配置。
--spec loadConfigFromEnv() -> ok.
-loadConfigFromEnv() ->
-    case os:getenv("LLM_PROVIDER") of
-        false -> ok;
-        Provider -> setConfig(provider, listToExistingAtom(Provider))
-    end,
-    case os:getenv("LLM_API_KEY") of
-        false -> ok;
-        ApiKey -> setConfig(api_key, ApiKey)
-    end,
-    case os:getenv("LLM_BASE_URL") of
-        false -> ok;
-        BaseUrl -> setConfig(base_url, BaseUrl)
-    end,
-    ok.
-
-%% 将字符串转为已存在的原子（配置解析用）。
--spec listToExistingAtom(string()) -> atom().
-listToExistingAtom(L) -> list_to_existing_atom(L).
+    alConfig:load().
 
 %% @doc 从指定路径加载配置文件。
 -spec loadConfigFromFile(string()) -> ok | {error, term()}.
 loadConfigFromFile(FilePath) ->
-    llmCliConfig:load(FilePath).
+    alConfig:load(FilePath).
 
 %%%===================================================================
 %%% 会话管理
@@ -1035,23 +1537,32 @@ clearSession(Session) ->
 %%% Token 估算与统计
 %%%===================================================================
 
-%% @doc 粗略估算文本 Token 数（按约 4 字符/token）。
+%% @doc 估算文本 Token 数（CJK 感知）。
+%% ASCII 约 4 字符/token；中日韩等宽字符约 1.5 字符/token，
+%% 比单纯按字节/4 更贴近真实分词，提升预算裁剪与费用估算精度。
 -spec estimateTokens(binary() | string()) -> non_neg_integer().
-estimateTokens(Text) ->
-    case Text of
-        B when is_binary(B) ->
-            Length = byteSize(B),
-            round(Length / 4);
-        L when is_list(L) ->
-            Length = length(L),
-            round(Length / 4);
-        _ ->
-            0
-    end.
+estimateTokens(Text) when is_binary(Text) ->
+    case unicode:characters_to_list(Text) of
+        L when is_list(L) -> estimateFromChars(L);
+        _ -> round(byte_size(Text) / 4)
+    end;
+estimateTokens(Text) when is_list(Text) ->
+    try estimateFromChars(Text) catch _:_ -> round(length(Text) / 4) end;
+estimateTokens(_) ->
+    0.
+
+%% 按 ASCII / 宽字符分别计权估算 token 数。
+estimateFromChars(Chars) ->
+    {Ascii, Wide} = lists:foldl(fun
+        (C, {A, W}) when is_integer(C), C =< 127 -> {A + 1, W};
+        (C, {A, W}) when is_integer(C) -> {A, W + 1};
+        (_, Acc) -> Acc
+    end, {0, 0}, Chars),
+    round(Ascii / 4 + Wide / 1.5).
 
 -define(TOKEN_STATS_TABLE, llmCliTokenStats).
 
-%% @doc 返回累计 Token 统计（按模型分组及总计）。
+%% @doc 返回累计 Token 统计（按模型分组及总计，含估算费用 USD）。
 -spec tokenStats() -> map().
 tokenStats() ->
     ensure_token_stats_table(),
@@ -1061,14 +1572,59 @@ tokenStats() ->
             TotalIn = sum_field(List, inputTokens),
             TotalOut = sum_field(List, outputTokens),
             TotalCalls = sum_field(List, calls),
+            ByModel = maps:from_list([
+                {Model, withCost(Model, Stats)} || {Model, Stats} <- List
+            ]),
+            TotalCost = lists:sum([
+                modelCost(Model, maps:get(inputTokens, S, 0), maps:get(outputTokens, S, 0))
+                || {Model, S} <- List
+            ]),
             #{
                 inputTokens => TotalIn,
                 outputTokens => TotalOut,
                 totalTokens => TotalIn + TotalOut,
                 apiCalls => TotalCalls,
-                byModel => maps:from_list(List)
+                estimatedCostUsd => roundCost(TotalCost),
+                byModel => ByModel
             }
     end.
+
+%% 为单模型统计追加估算费用字段。
+withCost(Model, Stats) ->
+    In = maps:get(inputTokens, Stats, 0),
+    Out = maps:get(outputTokens, Stats, 0),
+    Stats#{estimatedCostUsd => roundCost(modelCost(Model, In, Out))}.
+
+%% @doc 常见模型每百万 token 价格（美元）：`{输入价, 输出价}'。
+%% 未列出的模型按 0 计（不计费），价格随官方调整可在此更新。
+-spec modelPricing() -> #{binary() => {number(), number()}}.
+modelPricing() ->
+    #{
+        <<"gpt-4o"/utf8>> => {2.5, 10.0},
+        <<"gpt-4o-mini"/utf8>> => {0.15, 0.6},
+        <<"gpt-4.1"/utf8>> => {2.0, 8.0},
+        <<"gpt-4.1-mini"/utf8>> => {0.4, 1.6},
+        <<"gpt-4.1-nano"/utf8>> => {0.1, 0.4},
+        <<"o3-mini"/utf8>> => {1.1, 4.4},
+        <<"deepseek-chat"/utf8>> => {0.27, 1.1},
+        <<"deepseek-reasoner"/utf8>> => {0.55, 2.19},
+        <<"deepseek-v4-flash"/utf8>> => {0.1, 0.3},
+        <<"claude-3-5-sonnet-20241022"/utf8>> => {3.0, 15.0},
+        <<"claude-3-5-haiku-20241022"/utf8>> => {0.8, 4.0}
+    }.
+
+%% 查询模型价格；未知模型返回 {0, 0}（不计费）。
+priceFor(Model) ->
+    maps:get(toBinary(Model), modelPricing(), {0.0, 0.0}).
+
+%% 按价格表计算单模型估算费用（USD）。
+modelCost(Model, InputTokens, OutputTokens) ->
+    {PriceIn, PriceOut} = priceFor(Model),
+    (InputTokens * PriceIn + OutputTokens * PriceOut) / 1000000.
+
+%% 费用保留 6 位小数。
+roundCost(Cost) ->
+    erlang:round(Cost * 1000000) / 1000000.
 
 %% @doc 重置所有 Token 统计数据。
 -spec resetTokenStats() -> ok.
@@ -1108,11 +1664,8 @@ sum_field(List, Key) ->
 
 %% 空统计的默认值。
 default_stats() ->
-    #{inputTokens => 0, outputTokens => 0, totalTokens => 0, apiCalls => 0, byModel => #{}}.
-
-%% 获取二进制字节长度。
--spec byteSize(binary()) -> non_neg_integer().
-byteSize(B) -> byte_size(B).
+    #{inputTokens => 0, outputTokens => 0, totalTokens => 0, apiCalls => 0,
+      estimatedCostUsd => 0.0, byModel => #{}}.
 
 %%%===================================================================
 %%% 结果处理工具
@@ -1121,18 +1674,31 @@ byteSize(B) -> byte_size(B).
 %% @doc 将错误元组格式化为可读字符串。
 -spec formatError({error, term()}) -> string().
 formatError({error, {http_error, StatusCode, ErrorBody}}) ->
-    ErrorMsg = case ErrorBody of
-        #{<<"message"/utf8>> := Msg} -> Msg;
-        #{<<"error"/utf8>> := #{<<"message"/utf8>> := Msg}} -> Msg;
-        _ -> <<"Unknown error"/utf8>>
-    end,
+    ErrorMsg = extractHttpErrorMessage(ErrorBody),
     io_lib:format("HTTP error ~p: ~s", [StatusCode, ErrorMsg]);
+formatError({error, {http_error, StatusCode}}) ->
+    io_lib:format("HTTP error ~p", [StatusCode]);
+formatError({error, json_encode_failed}) ->
+    "Request JSON encode failed (invalid UTF-8 or oversized content)";
 formatError({error, invalid_response}) ->
     "Invalid response format";
 formatError({error, max_retries_exceeded}) ->
     "Maximum retries exceeded";
 formatError({error, Reason}) ->
     io_lib:format("Error: ~p", [Reason]).
+
+extractHttpErrorMessage(#{<<"message"/utf8>> := Msg}) ->
+    Msg;
+extractHttpErrorMessage(#{<<"error"/utf8>> := #{<<"message"/utf8>> := Msg}}) ->
+    Msg;
+extractHttpErrorMessage(#{<<"error"/utf8>> := Msg}) when is_binary(Msg) ->
+    Msg;
+extractHttpErrorMessage(#{<<"raw"/utf8>> := Raw}) ->
+    Raw;
+extractHttpErrorMessage(Body) when is_binary(Body) ->
+    Body;
+extractHttpErrorMessage(_) ->
+    <<"Unknown error"/utf8>>.
 
 %% @doc 判断结果是否为 `{ok, _}'。
 -spec isSuccess({ok, term()} | {error, term()}) -> boolean().

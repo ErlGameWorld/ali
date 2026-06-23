@@ -209,7 +209,7 @@ asyncProcessing() ->
 configFromEnv() ->
     io:format("=== 从环境变量加载配置示例 ===~n"),
     
-    llmCli:loadConfigFromEnv(),
+    llmCli:loadConfig(),
     
     Messages = [
         llmCli:userMessage("Hello from environment config!")

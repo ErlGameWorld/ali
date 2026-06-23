@@ -28,10 +28,22 @@ runEunit(Args, Config) ->
     Module = maps:get(module, Args, all),
     Timeout = maps:get(timeout, Args, 120000),
     Cmd = build_eunit_cmd(Module),
+    alTools:emitProgress(Config, #{
+        type => tool_progress,
+        phase => <<"running_eunit"/utf8>>,
+        module => Module,
+        message => <<"Running EUnit tests..."/utf8>>
+    }),
     Started = erlang:monotonic_time(millisecond),
     case run_command(Cmd, Root, Timeout) of
         {ok, {ExitCode, Output}} ->
             Elapsed = erlang:monotonic_time(millisecond) - Started,
+            alTools:emitProgress(Config, #{
+                type => tool_progress,
+                phase => <<"eunit_done"/utf8>>,
+                exitCode => ExitCode,
+                elapsedMs => Elapsed
+            }),
             {ok, #{
                 exitCode => ExitCode,
                 success => ExitCode =:= 0,
@@ -49,10 +61,22 @@ runCommonTest(Args, Config) ->
     Suite = maps:get(suite, Args, all),
     Timeout = maps:get(timeout, Args, 300000),
     Cmd = build_ct_cmd(Suite),
+    alTools:emitProgress(Config, #{
+        type => tool_progress,
+        phase => <<"running_ct"/utf8>>,
+        suite => Suite,
+        message => <<"Running Common Test suites..."/utf8>>
+    }),
     Started = erlang:monotonic_time(millisecond),
     case run_command(Cmd, Root, Timeout) of
         {ok, {ExitCode, Output}} ->
             Elapsed = erlang:monotonic_time(millisecond) - Started,
+            alTools:emitProgress(Config, #{
+                type => tool_progress,
+                phase => <<"ct_done"/utf8>>,
+                exitCode => ExitCode,
+                elapsedMs => Elapsed
+            }),
             {ok, #{
                 exitCode => ExitCode,
                 success => ExitCode =:= 0,
@@ -129,7 +153,7 @@ generateEunit(Args, Config) ->
 %% 从代码索引获取目标模块的导出函数列表（{Name, Arity}）。
 %% 索引不可用时返回空列表，调用方回退到冒烟测试。
 fetch_exports(Mod, _Config) ->
-    case alCodeIndexer:lookup_module(Mod) of
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, #{exports := Exports}} when is_list(Exports) -> Exports;
         _ -> []
     end.
@@ -165,7 +189,11 @@ collect_test_files(Dir) ->
 build_eunit_cmd(all) ->
     "rebar3 eunit";
 build_eunit_cmd(Mod) when is_atom(Mod) ->
-    "rebar3 eunit --module=" ++ atom_to_list(Mod).
+    "rebar3 eunit --module=" ++ atom_to_list(Mod);
+build_eunit_cmd(Mod) when is_binary(Mod) ->
+    build_eunit_cmd(binary_to_existing_atom(Mod, utf8));
+build_eunit_cmd(Mod) when is_list(Mod) ->
+    build_eunit_cmd(list_to_existing_atom(Mod)).
 
 build_ct_cmd(all) ->
     "rebar3 ct";
@@ -178,25 +206,27 @@ build_ct_cmd(Suite) when is_list(Suite) ->
 
 %% 渲染 Common Test 套件源码，基于导出函数生成测试用例。
 %% 0 元函数生成调用断言；其余生成 todo 占位用例。
+%% 使用显式 -export 而非 -compile(export_all)，避免误暴露内部函数。
 render_ct_suite(SuiteMod, Target, Exports) ->
     TestCases = build_ct_cases(Exports),
-    AllList = case TestCases of
-        [] -> <<"smoke_test"/utf8>>;
+    {AllList, Body, CaseNames} = case TestCases of
+        [] ->
+            {<<"smoke_test"/utf8>>, render_ct_smoke(Target), [smoke_test]};
         _ ->
             Names = [case C of {N, _} -> N; N -> N end || C <- TestCases],
-            iolist_to_binary(lists:join(<<", "/utf8>>, [atom_to_binary(N, utf8) || N <- Names]))
+            AllBin = iolist_to_binary(lists:join(<<", "/utf8>>, [atom_to_binary(N, utf8) || N <- Names])),
+            Cases = [render_ct_case(Target, C) || C <- TestCases],
+            {AllBin, Cases, Names}
     end,
-    Body = case TestCases of
-        [] -> render_ct_smoke(Target);
-        _ ->
-            [render_ct_case(Target, C) || C <- TestCases]
-    end,
+    ExportList = iolist_to_binary(lists:join(<<", "/utf8>>, [
+        <<"all/0"/utf8>> |
+        [<<(atom_to_binary(N, utf8))/binary, "/1"/utf8>> || N <- CaseNames]
+    ])),
     iolist_to_binary([
         <<"-module("/utf8>>, atom_to_binary(SuiteMod, utf8), <<").\n\n"/utf8>>,
-        <<"-compile(export_all).\n\n"/utf8>>,
+        <<"-export(["/utf8>>, ExportList, <<"]).\n\n"/utf8>>,
         <<"all() -> ["/utf8>>, AllList, <<"].\n\n"/utf8>>,
-        Body,
-        <<".\n"/utf8>>
+        Body
     ]).
 
 %% 为每个导出函数构造 Common Test 用例名与调用信息。
@@ -265,6 +295,7 @@ collect_port_deadline(Port, Acc, Deadline) ->
     Now = erlang:monotonic_time(millisecond),
     case Deadline > Now of
         false ->
+            try port_close(Port) catch _:_ -> ok end,
             {error, timeout};
         true ->
             Remaining = Deadline - Now,
@@ -276,12 +307,16 @@ collect_port_deadline(Port, Acc, Deadline) ->
                 {Port, {exit_status, Code}} ->
                     {ok, {Code, Acc}}
             after Remaining ->
+                try port_close(Port) catch _:_ -> ok end,
                 {error, timeout}
             end
     end.
 
 %% 渲染 EUnit 测试模块源码，基于导出函数生成测试用例。
 %% 0 元函数生成调用断言；其余生成待办占位。
+%% 注意：生成的测试会直接调用目标模块的 0 元函数，若该函数有副作用
+%% （写文件、发消息、启动进程等），运行测试可能污染环境。
+%% 用户应根据实际情况补充 mock 或在测试前后清理状态。
 render_test_module(TestMod, Target, Exports) ->
     Tests = build_eunit_tests(Target, Exports),
     Body = case Tests of
@@ -290,9 +325,9 @@ render_test_module(TestMod, Target, Exports) ->
     end,
     iolist_to_binary([
         <<"-module("/utf8>>, atom_to_binary(TestMod, utf8), <<").\n\n"/utf8>>,
+        <<"%% 自动生成：0 元函数测试会直接调用目标函数，注意副作用。\n\n"/utf8>>,
         <<"-include_lib(\"eunit/include/eunit.hrl\").\n\n"/utf8>>,
-        Body,
-        <<".\n"/utf8>>
+        Body
     ]).
 
 %% 为每个导出函数构造 EUnit 测试生成器代码片段。
@@ -343,6 +378,9 @@ to_list(X) when is_binary(X) -> binary_to_list(X);
 to_list(X) when is_list(X) -> X;
 to_list(X) when is_atom(X) -> atom_to_list(X).
 
+to_atom(undefined) -> undefined;
 to_atom(X) when is_atom(X) -> X;
-to_atom(X) when is_binary(X) -> binary_to_atom(X, utf8);
-to_atom(X) when is_list(X) -> list_to_atom(X).
+to_atom(X) when is_binary(X) ->
+    try binary_to_existing_atom(X, utf8) catch _:_ -> undefined end;
+to_atom(X) when is_list(X) ->
+    try list_to_existing_atom(X) catch _:_ -> undefined end.

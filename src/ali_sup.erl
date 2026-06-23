@@ -7,17 +7,18 @@
 %%% <ul>
 %%%   <li>{@link alCodeIndexer} — 项目 .erl 代码索引</li>
 %%%   <li>{@link alServer} — Agent 核心 gen_server</li>
+%%%   <li>{@link alWebSup} — Web 子系统（连接监督 + HTTP 服务）</li>
 %%% </ul>
 %%%
-%%% {@link alWebSrv} 不在此处静态启动，由 {@link alWebSrv:start_web/0}
-%%% 按需动态添加为临时子进程。
+%%% {@link alWebSrv} 在 {@link alWebSup} 下常驻启动；HTTP 监听仍由
+%%% {@link alWebSrv:startWeb/0} 按需开启。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(ali_sup).
 
 -behaviour(supervisor).
 
--export([start_link/0, start_indexer/0, init/1]).
+-export([start_link/0, startIndexer/0, init/1]).
 
 -define(SERVER, ?MODULE).
 
@@ -27,11 +28,11 @@ start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 %% @doc 动态添加代码索引器子进程（索引器通常已在 init/1 中启动，本函数供按需扩容）。
--spec start_indexer() -> supervisor:startchild_ret().
-start_indexer() ->
+-spec startIndexer() -> supervisor:startchild_ret().
+startIndexer() ->
     supervisor:start_child(?SERVER, #{
         id => alCodeIndexer,
-        start => {alCodeIndexer, start_link, []},
+        start => {alCodeIndexer, startLink, []},
         restart => permanent,
         shutdown => 5000,
         type => worker,
@@ -49,7 +50,7 @@ init([]) ->
     ChildSpecs = [
         #{
             id => alCodeIndexer,
-            start => {alCodeIndexer, start_link, []},
+            start => {alCodeIndexer, startLink, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
@@ -62,6 +63,22 @@ init([]) ->
             shutdown => 5000,
             type => worker,
             modules => [alServer]
+        },
+        #{
+            id => alMcp,
+            start => {alMcp, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alMcp]
+        },
+        #{
+            id => alWebSup,
+            start => {alWebSup, start_link, []},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [alWebSup]
         }
     ],
     {ok, {SupFlags, ChildSpecs}}.

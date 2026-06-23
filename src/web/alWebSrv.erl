@@ -11,7 +11,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, start_web/0, stop/0, port/0, running/0]).
+-export([startLink/0, startWeb/0, stop/0, port/0, running/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
@@ -19,15 +19,15 @@
 -define(DEFAULT_PORT, 8088).
 
 %% @doc 启动 gen_server（通常由 supervisor 调用，勿直接调用）。
--spec start_link() -> {ok, pid()} | {error, term()}.
-start_link() ->
+-spec startLink() -> {ok, pid()} | {error, term()}.
+startLink() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %% @doc 启动 HTTP 监听；若进程未运行则先向 ali_sup 注册子进程。
 %% @returns `{ok, Port}' 或 `{error, Reason}'
--spec start_web() -> {ok, non_neg_integer()} | {error, term()}.
-start_web() ->
-    try call_start_web() of
+-spec startWeb() -> {ok, non_neg_integer()} | {error, term()}.
+startWeb() ->
+    try callStartWeb() of
         Result -> Result
     catch
         exit:{noproc, _} ->
@@ -38,28 +38,13 @@ start_web() ->
             {error, {webSrvExit, Reason}}
     end.
 
-call_start_web() ->
+callStartWeb() ->
     case whereis(?SERVER) of
         undefined ->
-            case supervisor:start_child(ali_sup, web_child_spec()) of
-                {ok, _} -> gen_server:call(?SERVER, start_web, 30000);
-                {error, {already_started, _}} -> gen_server:call(?SERVER, start_web, 30000);
-                {error, Reason} -> {error, Reason}
-            end;
+            {error, webSrvNotRunning};
         _ ->
-            gen_server:call(?SERVER, start_web, 30000)
+            gen_server:call(?SERVER, startWeb, 30000)
     end.
-
-%% @doc 构造 alWebSrv 的 supervisor child_spec。
-web_child_spec() ->
-    #{
-        id => alWebSrv,
-        start => {alWebSrv, start_link, []},
-        restart => transient,
-        shutdown => 5000,
-        type => worker,
-        modules => [alWebSrv]
-    }.
 
 %% @doc 停止 HTTP 监听并关闭 gen_server。
 -spec stop() -> ok.
@@ -83,17 +68,19 @@ running() ->
     whereis(?SERVER) =/= undefined.
 
 %% @doc gen_server 初始化；HTTP 尚未启动。
+%% 在此创建速率限制 ETS 表，使其归属本长生命周期进程。
 init([]) ->
+    alWebSec:ensureStarted(),
     {ok, #{port => undefined, enabled => false}}.
 
-%% @doc 处理同步调用：start_web / stop / port 查询。
-handle_call(start_web, _From, State) ->
-    Port = web_port(),
+%% @doc 处理同步调用：startWeb / stop / port 查询。
+handle_call(startWeb, _From, State) ->
+    Port = webPort(),
     case maps:get(enabled, State, false) of
         true ->
             {reply, {ok, maps:get(port, State)}, State};
         false ->
-            case start_http(Port) of
+            case startHttp(Port) of
                 ok ->
                     {reply, {ok, Port}, State#{port => Port, enabled => true}};
                 {error, Reason} ->
@@ -101,7 +88,7 @@ handle_call(start_web, _From, State) ->
             end
     end;
 handle_call(stop, _From, State) ->
-    stop_http(maps:get(port, State, undefined)),
+    stopHttp(maps:get(port, State, undefined)),
     {stop, normal, ok, State#{enabled => false, port => undefined}};
 handle_call(port, _From, State) ->
     {reply, maps:get(port, State, undefined), State};
@@ -121,11 +108,16 @@ handle_info(_Info, State) ->
 %%%===================================================================
 
 %% @doc 启动 eWSrv HTTP 监听，请求路由至 alWebHer。
-start_http(Port) ->
-    case ensure_apps() of
+startHttp(Port) ->
+    case ensureApps() of
         ok ->
-            _ = ensure_ewsrv_started(),
-            case eWSrv:openSrv(Port, [{wsMod, alWebHer}]) of
+            _ = ensureEwsrvStarted(),
+            WsOpts = [
+                {wsMod, alWebHer},
+                {wsSupName, alWebConnSup},
+                {chunkedSupp, true}
+            ],
+            case eWSrv:openSrv(Port, WsOpts) of
                 {ok, _} -> ok;
                 {error, OpenReason} -> {error, OpenReason};
                 ok -> ok
@@ -135,7 +127,7 @@ start_http(Port) ->
     end.
 
 %% 确保 eWSrv 与 parse_trans 依赖已启动。
-ensure_apps() ->
+ensureApps() ->
     case application:ensure_all_started(eWSrv) of
         {ok, _} ->
             case application:ensure_all_started(parse_trans) of
@@ -147,26 +139,27 @@ ensure_apps() ->
     end.
 
 %% 确保 eWSrv 应用进程已运行。
-ensure_ewsrv_started() ->
-    case catch eWSrv:start() of
+ensureEwsrvStarted() ->
+    try eWSrv:start() of
         {ok, _} -> ok;
         ok -> ok;
         {error, {already_started, _}} -> ok;
         {error, StartReason} -> {error, StartReason};
-        Other when Other =:= already_started -> ok;
-        {'EXIT', _} -> ok
+        Other when Other =:= already_started -> ok
+    catch
+        _:_ -> ok
     end.
 
 %% @doc 关闭指定端口的 HTTP 监听。
-stop_http(undefined) ->
+stopHttp(undefined) ->
     ok;
-stop_http(Port) ->
-    catch eWSrv:closeSrv(Port),
+stopHttp(Port) ->
+    try eWSrv:closeSrv(Port) catch _:_ -> ok end,
     ok.
 
-%% @doc 从应用环境读取 webPort，默认 8088。
-web_port() ->
-    case application:get_env(ali, webPort) of
-        {ok, P} when is_integer(P) -> P;
-        undefined -> ?DEFAULT_PORT
+%% @doc 从 aliCfg.cfg 读取 webPort，默认 8088。
+webPort() ->
+    case alConfig:val(webPort) of
+        P when is_integer(P) -> P;
+        _ -> ?DEFAULT_PORT
     end.

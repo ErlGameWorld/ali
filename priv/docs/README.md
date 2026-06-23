@@ -4,19 +4,20 @@
 
 ## 文档索引
 
-| 文档 | 受众 | 内容 |
-|------|------|------|
-| [API.md](API.md) | 使用者 | `ali` 模块全部对外 API |
-| [LLM.md](LLM.md) | 使用者 | LLM 直连 API（`llmCli` / `ali:llm*`） |
-| [CONFIG.md](CONFIG.md) | 运维/开发者 | `config.cfg` 与环境变量 |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | 开发者 | 模块划分、OTP 结构、数据流 |
-| [TOOLS.md](TOOLS.md) | 使用者/Agent | 工具列表与权限级别 |
-| [AGENT_DEVELOPMENT_PLAN.md](AGENT_DEVELOPMENT_PLAN.md) | 维护者 | 产品定位、阶段规划、实现进度 |
+| 文档                                                     | 受众        | 内容                                |
+|--------------------------------------------------------|-----------|-----------------------------------|
+| [API.md](API.md)                                       | 使用者       | `ali` 模块全部对外 API                  |
+| [LLM.md](LLM.md)                                       | 使用者       | LLM 直连 API（`llmCli` / `ali:llm*`） |
+| [CONFIG.md](CONFIG.md)                                 | 运维/开发者    | `config.cfg` 与环境变量                |
+| [ARCHITECTURE.md](ARCHITECTURE.md)                     | 开发者       | 模块划分、OTP 结构、数据流                   |
+| [TOOLS.md](TOOLS.md)                                   | 使用者/Agent | 工具列表与权限级别                         |
+| [AGENT_DEVELOPMENT_PLAN.md](AGENT_DEVELOPMENT_PLAN.md) | 维护者       | 产品定位、阶段规划、实现进度                    |
+| [ENHANCEMENT_PLAN.md](ENHANCEMENT_PLAN.md)             | 维护者/决策者   | 功能审核结论 + 完善/优化/新增开发计划             |
 
 ## 快速链接
 
 - 项目 README：[../../README.md](../../README.md)
-- 配置示例：[../../config/config.example.cfg](../../config/config.example.cfg)
+- 配置示例：[../../config/config.example.cfg](../../config/aliCfg.example.cfg)
 - 对外 API 源码：[../../src/ali.erl](../../src/ali.erl)
 
 ## 使用约定

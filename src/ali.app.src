@@ -1,9 +1,9 @@
 {application, ali, [
     {description, "An OTP application"},
     {vsn, "0.1.0"},
-    {registered, [ali_sup, alCodeIndexer, alServer]},
+    {registered, [ali_sup, alCodeIndexer, alServer, alWebSup, alWebConnSup, alWebSrv]},
     {mod, {ali_app, []}},
-    {applications, [kernel, stdlib, hackney, eWSrv, parse_trans, syntax_tools]},
+    {applications, [kernel, stdlib, hackney, eWSrv, jiffy, parse_trans, syntax_tools, erlfmt]},
     {env, []},
     {modules, []},
     {licenses, ["MIT"]},

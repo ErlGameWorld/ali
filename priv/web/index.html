@@ -11,28 +11,45 @@
     <header class="header">
       <span class="brand-title">ali</span>
       <span class="brand-meta">Erlang 节点内智能开发助手 · edit 模式写文件需「批准执行」</span>
+      <span id="connDot" class="conn-dot" title="连接状态">●</span>
+      <button id="btnToken" type="button" class="btn-muted btn-xs" title="设置 Web API Token">Token</button>
     </header>
 
     <div id="approveBar" class="approve-bar hidden">
-      <span id="approveText">有待确认的操作</span>
-      <button id="btnApprove" type="button">批准执行</button>
-      <button id="btnDismissApprove" type="button" class="btn-muted">忽略</button>
-    </div>
-
-    <div id="tasksPanel" class="tasks-panel hidden">
-      <div class="tasks-header">
-        <strong>后台任务</strong>
-        <button id="btnCloseTasks" type="button" class="btn-muted">关闭</button>
+      <div class="approve-row">
+        <span id="approveText">有待确认的操作</span>
+        <span class="approve-actions">
+          <button id="btnApprove" type="button">批准执行</button>
+          <button id="btnDismissApprove" type="button" class="btn-muted">忽略</button>
+        </span>
       </div>
-      <ul id="tasksList"></ul>
+      <pre id="approveDiff" class="diff-view hidden"></pre>
     </div>
 
-    <main class="chat" id="chat"></main>
+    <div class="body">
+      <main class="chat" id="chat"></main>
+
+      <aside id="sidePanel" class="side-panel hidden">
+        <div class="side-tabs">
+          <button class="side-tab active" data-tab="tasks" type="button">任务</button>
+          <button class="side-tab" data-tab="plan" type="button">规划</button>
+          <button class="side-tab" data-tab="metrics" type="button">指标</button>
+          <button id="btnCloseSide" class="btn-muted side-close" type="button">×</button>
+        </div>
+        <div id="tabTasks" class="side-body"><ul id="tasksList"></ul></div>
+        <div id="tabPlan" class="side-body hidden"><ul id="planList"></ul></div>
+        <div id="tabMetrics" class="side-body hidden"><div id="metricsBox"></div></div>
+      </aside>
+    </div>
 
     <footer class="composer">
+      <div id="attachPreview" class="attach-preview hidden"></div>
       <textarea id="prompt" rows="2" placeholder="输入问题，例如：分析 alLoop 的工作流程"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
+          <input type="file" id="fileInput" multiple hidden
+            accept="image/*,.pdf,.erl,.hrl,.md,.txt,.json,.yaml,.yml,.cfg,.conf,.js,.ts,.jsx,.tsx,.html,.css,.xml,.csv,.toml,.ini,.py,.go,.rs,.java,.c,.cpp,.h,.sql,.sh,.src,.app,.config,.vue,.svelte,.kt,.swift,.rb,.php,.lua,.proto">
+          <button id="btnAttach" type="button" class="btn-muted btn-xs">附件</button>
           <label>模式
             <select id="modeSelect">
               <option value="ask">ask（只读）</option>
@@ -42,21 +59,27 @@
           </label>
           <label>会话
             <select id="sessionSelect">
-              <option value="">当前会话</option>
+              <option value="web">web（默认）</option>
             </select>
           </label>
+          <button id="btnSaveSession" type="button" class="btn-muted btn-xs">保存</button>
+          <button id="btnDeleteSession" type="button" class="btn-muted btn-xs">删除</button>
           <button id="btnRefreshIndex" type="button" class="btn-muted btn-xs">索引</button>
-          <button id="btnTasks" type="button" class="btn-muted btn-xs">任务</button>
+          <button id="btnTasks" type="button" class="btn-muted btn-xs">面板</button>
           <button id="btnClear" type="button" class="btn-muted btn-xs">清空</button>
           <button id="btnEunit" type="button" class="btn-muted btn-xs">EUnit</button>
         </div>
         <div class="composer-right">
           <span id="statusText" class="status">就绪</span>
+          <button id="btnStop" type="button" class="btn-stop hidden">停止</button>
           <button id="btnSend" type="button" class="btn-send">发送</button>
         </div>
       </div>
     </footer>
   </div>
+  <!--ALI_WEB_CONFIG-->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>if (window.mermaid) { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); }</script>
   <script src="/static/app.js"></script>
 </body>
 </html>

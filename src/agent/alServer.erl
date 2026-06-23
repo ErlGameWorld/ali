@@ -1,10 +1,18 @@
 %%%-------------------------------------------------------------------
-%%% @doc Agent 核心 gen_server。
+%%% @doc Agent 核心协调层（薄 gen_server）。
 %%%
-%%% 管理多会话状态、配置、工作上下文，并将 ask/run 请求
-%%% 委托给 {@link alLoop} 执行 LLM + 工具循环。
+%%% 作为注册表与路由层，维护全局配置（config / mode /
+%%% workingContext）与会话→工作进程映射。所有 per-session 操作
+%%% （ask / approve / clearSession 等）委托给 {@link alSessionWorker}。
 %%%
-%%% 注册名：`alServer`。对外请通过 {@link ali} 模块调用，勿直接使用本模块。
+%%% 架构收益：
+%%% <ul>
+%%%   <li>不同会话的 ask 完全并行（各自独立 worker 进程）</li>
+%%%   <li>单会话 worker 崩溃不影响其他会话</li>
+%%%   <li>`cancelTask' 按 taskId 精准取消，不误伤同会话其他任务</li>
+%%% </ul>
+%%%
+%%% 注册名：`alServer'。对外请通过 {@link ali} 模块调用。
 %%% @end
 %%%-------------------------------------------------------------------
 -module(alServer).
@@ -23,6 +31,9 @@
     askAsync/2,
     run/1,
     approve/1,
+    dismiss/1,
+    pendingTask/1,
+    pendingList/0,
     status/0,
     tools/0,
     sessions/0,
@@ -33,6 +44,9 @@
     loadSession/1,
     deleteSavedSession/1,
     savedSessions/0,
+    sessionMessages/1,
+    cancelAsk/0,
+    cancelAsk/1,
     taskStatus/1,
     cancelTask/1,
     tasks/0,
@@ -45,276 +59,180 @@
     clearContext/0
 ]).
 
--export([
-    init/1,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    terminate/2,
-    code_change/3
-]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
 
 -record(state, {
-    config = defaultConfig(),
-    sessions = #{},
+    runtimeOverrides = #{},
+    sessions = #{},              %% SessionId => WorkerPid
     defaultSession = <<"default"/utf8>>,
-    pendingTasks = #{},
-    pendingAsks = #{},
     mode = ask,
     workingContext = #{modules => [], files => [], processes => []}
 }).
 
 -define(SERVER, alServer).
+-define(DEFAULT_MODEL, <<"gpt-4o-mini"/utf8>>).
 
-%% @doc 启动 Agent 服务（使用默认配置）。
--spec startLink() -> {ok, pid()} | {error, term()}.
-startLink() ->
-    startLink([]).
+%%%===================================================================
+%%% API
+%%%===================================================================
 
-%% @doc 启动 Agent 服务，可传入初始选项覆盖默认配置。
-%% @param Opts 配置项列表或 map，合并到默认配置
-%% @returns `{ok, pid()}` 或 `{error, term()}`
--spec startLink(list() | map()) -> {ok, pid()} | {error, term()}.
+startLink() -> startLink([]).
+
 startLink(Opts) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, Opts, []).
 
-%% @doc 优雅停止 Agent gen_server。
--spec stop() -> ok.
 stop() ->
     case whereis(?SERVER) of
         undefined -> ok;
         Pid -> gen_server:stop(Pid)
     end.
 
-%% @doc 同步提问（使用默认会话与配置）。
-%% @param Prompt 用户提示词（binary 或 string）
-%% @returns `{ok, binary()}` 回答，或 `{error, term()}`
--spec ask(binary() | string()) -> {ok, binary()} | {error, term()}.
-ask(Prompt) ->
-    ask(Prompt, #{}).
+ask(Prompt) -> ask(Prompt, #{}).
 
-%% @doc 同步提问，可指定会话 ID、模型等选项。
-%% @param Prompt 用户提示词
-%% @param Opts 选项 map，如 sessionId、model、progressId 等
-%% @returns 同 ask/1
--spec ask(binary() | string(), map()) -> {ok, binary()} | {error, term()}.
 ask(Prompt, Opts) when is_binary(Prompt); is_list(Prompt) ->
     gen_server:call(?SERVER, {ask, toBinary(Prompt), Opts}, infinity).
 
-%% @doc 流式提问（使用默认选项），增量结果发送到调用进程。
-%% @param Prompt 用户提示词
-%% @returns 同 ask/1
--spec askStream(binary() | string()) -> {ok, binary()} | {error, term()}.
-askStream(Prompt) ->
-    askStream(Prompt, #{}).
+askStream(Prompt) -> askStream(Prompt, #{}).
 
-%% @doc 流式提问，LLM 输出通过消息发送到调用进程。
-%% @param Prompt 用户提示词
-%% @param Opts 选项 map
-%% @returns 同 ask/1
--spec askStream(binary() | string(), map()) -> {ok, binary()} | {error, term()}.
 askStream(Prompt, Opts) when is_binary(Prompt); is_list(Prompt) ->
     gen_server:call(?SERVER, {askStream, toBinary(Prompt), Opts, self()}, infinity).
 
-%% @doc 异步提问（使用默认选项），立即返回 TaskId。
-%% @param Prompt 用户提示词
-%% @returns `{ok, binary()}` TaskId
--spec askAsync(binary() | string()) -> {ok, binary()}.
-askAsync(Prompt) ->
-    askAsync(Prompt, #{}).
+askAsync(Prompt) -> askAsync(Prompt, #{}).
 
-%% @doc 异步提问，通过 alTask 在后台执行，可用 taskStatus/1 查询结果。
-%% @param Prompt 用户提示词
-%% @param Opts 选项 map
-%% @returns `{ok, binary()}` TaskId
--spec askAsync(binary() | string(), map()) -> {ok, binary()}.
 askAsync(Prompt, Opts) when is_binary(Prompt); is_list(Prompt) ->
     gen_server:call(?SERVER, {askAsync, toBinary(Prompt), Opts}).
 
-%% @doc 在当前会话中执行 Erlang 函数（callFunction 工具封装）。
-%% @param {Mod, Fun, Args} 模块、函数名、参数列表
-%% @returns 工具执行结果 `{ok, map()}` 或 `{error, term()}`
--spec run({module(), atom(), list()}) -> {ok, map()} | {error, term()}.
 run({Mod, Fun, Args}) ->
     gen_server:call(?SERVER, {run, Mod, Fun, Args}, infinity).
 
-%% @doc 批准待确认的高风险/写操作任务。
-%% @param TaskId 待确认任务 ID（由 pending 响应中的 TaskId 提供）
-%% @returns 工具执行结果
--spec approve(binary() | string()) -> {ok, map()} | {error, term()}.
 approve(TaskId) ->
     gen_server:call(?SERVER, {approve, TaskId}, infinity).
 
-%% @doc 返回 Agent 运行状态摘要（节点、会话数、模式、索引统计等）。
-%% @returns `{map()}`
--spec status() -> map().
+dismiss(TaskId) ->
+    gen_server:call(?SERVER, {dismiss, TaskId}, infinity).
+
+pendingTask(TaskId) ->
+    gen_server:call(?SERVER, {pendingTask, TaskId}, infinity).
+
+pendingList() ->
+    gen_server:call(?SERVER, pendingList, infinity).
+
 status() ->
     gen_server:call(?SERVER, status).
 
-%% @doc 返回所有已注册工具的名称列表。
-%% @returns `[atom()]`
--spec tools() -> [atom()].
-tools() ->
-    alTools:listTools().
+tools() -> alTools:listTools().
 
-%% @doc 返回内存中所有活跃会话的摘要信息。
-%% @returns `{map()}` SessionId => #{id, messageCount, createdAt, updatedAt}
--spec sessions() -> map().
 sessions() ->
     gen_server:call(?SERVER, sessions).
 
-%% @doc 清空默认会话的消息历史。
-%% @returns `ok`
--spec clearSession() -> ok.
 clearSession() ->
     gen_server:call(?SERVER, clearSession).
 
-%% @doc 清空指定会话的消息历史。
-%% @param SessionId 会话标识
-%% @returns `ok`
--spec clearSession(binary() | string()) -> ok.
 clearSession(SessionId) ->
     gen_server:call(?SERVER, {clearSession, SessionId}).
 
-%% @doc 将默认会话持久化到磁盘。
-%% @returns `ok` 或 `{error, term()}`
--spec saveSession() -> ok | {error, term()}.
 saveSession() ->
     gen_server:call(?SERVER, saveSession).
 
-%% @doc 将指定会话持久化到磁盘。
-%% @param SessionId 会话标识
-%% @returns `ok` 或 `{error, term()}`
--spec saveSession(binary() | string()) -> ok | {error, term()}.
 saveSession(SessionId) ->
     gen_server:call(?SERVER, {saveSession, SessionId}).
 
-%% @doc 从磁盘加载会话并设为当前默认会话。
-%% @param SessionId 会话标识
-%% @returns `ok` 或 `{error, term()}`
--spec loadSession(binary() | string()) -> ok | {error, term()}.
 loadSession(SessionId) ->
     gen_server:call(?SERVER, {loadSession, SessionId}).
 
-%% @doc 删除磁盘上已保存的会话文件（不影响内存中的会话）。
-%% @param SessionId 会话标识
-%% @returns `ok` 或 `{error, term()}`
--spec deleteSavedSession(binary() | string()) -> ok | {error, term()}.
 deleteSavedSession(SessionId) ->
     gen_server:call(?SERVER, {deleteSavedSession, SessionId}).
 
-%% @doc 列举所有已保存到磁盘的会话 ID。
-%% @returns `[binary()]`
--spec savedSessions() -> [binary()].
 savedSessions() ->
     gen_server:call(?SERVER, savedSessions).
 
-%% @doc 查询异步任务状态（委托 alTask:status/1）。
-%% @param TaskId 任务标识
-%% @returns `{ok, map()}` 或 `{error, notFound}`
--spec taskStatus(binary() | string()) -> {ok, map()} | {error, notFound}.
-taskStatus(TaskId) ->
-    alTask:status(TaskId).
+sessionMessages(SessionId) ->
+    gen_server:call(?SERVER, {sessionMessages, SessionId}).
 
-%% @doc 取消正在运行的异步任务。
-%% @param TaskId 任务标识
-%% @returns `ok` 或 `{error, term()}`
--spec cancelTask(binary() | string()) -> ok | {error, term()}.
+cancelAsk() ->
+    gen_server:call(?SERVER, cancelAsk).
+
+cancelAsk(SessionId) when is_binary(SessionId) ->
+    gen_server:call(?SERVER, {cancelAsk, SessionId}).
+
+taskStatus(TaskId) -> alTask:status(TaskId).
+
+%% 精准取消：通过 worker 按 taskId 定位特定 ask，不误伤同会话其他任务。
 cancelTask(TaskId) ->
-  alTask:cancel(TaskId).
+    case alTask:status(TaskId) of
+        {ok, #{sessionId := SessionId}} ->
+            _ = gen_server:call(?SERVER, {cancelTask, SessionId, TaskId}),
+            alTask:cancel(TaskId);
+        {error, notFound} ->
+            {error, notFound}
+    end.
 
-%% @doc 返回所有异步任务列表。
-%% @returns `[map()]`
--spec tasks() -> [map()].
-tasks() ->
-    alTask:list().
+tasks() -> alTask:list().
 
-%% @doc 获取当前 Agent 配置 map。
-%% @returns `{map()}`
--spec getConfig() -> map().
-getConfig() ->
-    gen_server:call(?SERVER, getConfig).
+getConfig() -> gen_server:call(?SERVER, getConfig).
 
-%% @doc 设置单个配置项。
-%% @param Key 配置键（atom）
-%% @param Value 配置值
-%% @returns `ok`
--spec setConfig(atom(), term()) -> ok.
-setConfig(Key, Value) ->
-    gen_server:call(?SERVER, {setConfig, Key, Value}).
+setConfig(Key, Value) -> gen_server:call(?SERVER, {setConfig, Key, Value}).
 
-%% @doc 获取当前运行模式（ask / edit / exec）。
-%% @returns `{atom()}`
--spec getMode() -> ask | edit | exec.
-getMode() ->
-    gen_server:call(?SERVER, getMode).
+getMode() -> gen_server:call(?SERVER, getMode).
 
-%% @doc 设置运行模式。
-%% @param Mode ask | edit | exec
-%% @returns `ok` 或 `{error, invalidMode}`
--spec setMode(ask | edit | exec) -> ok | {error, invalidMode}.
-setMode(Mode) ->
-    gen_server:call(?SERVER, {setMode, Mode}).
+setMode(Mode) -> gen_server:call(?SERVER, {setMode, Mode}).
 
-%% @doc 获取当前工作上下文（关注的模块、文件、进程列表）。
-%% @returns `{map()}`
--spec getWorkingContext() -> map().
-getWorkingContext() ->
-    gen_server:call(?SERVER, getWorkingContext).
+getWorkingContext() -> gen_server:call(?SERVER, getWorkingContext).
 
-%% @doc 向工作上下文添加一项（module / file / process）。
-%% @param Type 上下文类型
-%% @param Value 要添加的值
-%% @returns `ok`
--spec addContext(atom() | binary(), term()) -> ok.
-addContext(Type, Value) ->
-    gen_server:call(?SERVER, {addContext, Type, Value}).
+addContext(Type, Value) -> gen_server:call(?SERVER, {addContext, Type, Value}).
 
-%% @doc 清空工作上下文。
-%% @returns `ok`
--spec clearContext() -> ok.
-clearContext() ->
-    gen_server:call(?SERVER, clearContext).
+clearContext() -> gen_server:call(?SERVER, clearContext).
 
-%% gen_server 初始化：创建审计/任务表、合并配置、预热代码索引
+%%%===================================================================
+%%% gen_server 回调
+%%%===================================================================
+
 init(Opts) ->
     alAudit:init(),
     alTask:init(),
-    Config = maps:merge(
-        maps:merge(defaultConfig(), llmCliConfig:getAgentConfig()),
-        maps:from_list(Opts)
-    ),
-    DefaultSession = maps:get(defaultSession, Config, <<"default"/utf8>>),
-    Session = newSession(DefaultSession),
-    _ = catch alCodeIndexer:refresh(Config),
+    alMetrics:init(),
+    Overrides = maps:from_list(Opts),
+    Config = effectiveConfig(Overrides, maps:get(mode, Overrides, ask)),
+    DefaultSession = maps:get(defaultSession, Overrides, <<"default"/utf8>>),
+    Mode = maps:get(mode, Overrides, maps:get(mode, Config, ask)),
+    _ = try alCodeIndexer:refresh(Config) catch _:_ -> ok end,
     {ok, #state{
-        config = Config,
+        runtimeOverrides = Overrides,
         defaultSession = DefaultSession,
-        sessions = maps:put(DefaultSession, Session, #{}),
-        mode = maps:get(mode, Config, ask),
+        mode = Mode,
         workingContext = defaultWorkingContext()
     }}.
 
-%% 同步 ask：异步 worker 执行 LLM 循环，通过 gen_server:reply 返回
+%% 同步 ask：cast 到 worker，worker 完成后直接 reply 调用者（不阻塞 alServer）
 handle_call({ask, Prompt, Opts}, From, State) ->
-    doAskAsync(Prompt, Opts, State, From, undefined);
-%% 流式 ask：增量输出发送到 Caller 进程
+    SessionId = maps:get(sessionId, Opts, State#state.defaultSession),
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    alSessionWorker:ask(WorkerPid, From, Prompt, Opts, effectiveConfig(State),
+                        State#state.mode, State#state.workingContext),
+    {noreply, NewState};
+
+%% 流式 ask
 handle_call({askStream, Prompt, Opts, Caller}, From, State) ->
-    doAskAsync(Prompt, Opts, State, From, Caller);
-%% 异步 ask：spawn alTask worker，立即返回 TaskId
+    SessionId = maps:get(sessionId, Opts, State#state.defaultSession),
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    alSessionWorker:askStream(WorkerPid, From, Prompt, Opts, Caller, effectiveConfig(State),
+                              State#state.mode, State#state.workingContext),
+    {noreply, NewState};
+
+%% 异步 ask：通过 alTask，runner 内部调用 alServer:ask 同步等待 worker 完成
 handle_call({askAsync, Prompt, Opts}, _From, State) ->
     Server = self(),
     CleanOpts = maps:remove(server, Opts),
     {ok, TaskId} = alTask:spawnAsk(Prompt, CleanOpts, fun(P, O) ->
         Tid = maps:get(taskId, O),
         alProgress:emit(Tid, #{
-            type => step,
-            phase => queue,
+            type => step, phase => queue,
             message => <<"等待 Agent 处理请求..."/utf8>>
         }),
         ProgressOpts = maps:put(progressId, Tid, maps:remove(taskId, O)),
-        %% 设置 10 分钟超时，防止 gen_server 故障时 worker 永久挂起
-        case gen_server:call(Server, {ask, P, ProgressOpts}, 600000) of
+        %% 通过 alServer:ask 路由到 worker，阻塞等待结果
+        case gen_server:call(Server, {ask, P, ProgressOpts#{taskId => Tid}}, 600000) of
             {ok, Ans} ->
                 alProgress:finish(Tid, {ok, Ans}),
                 {{ok, Ans}, #{}};
@@ -324,63 +242,119 @@ handle_call({askAsync, Prompt, Opts}, _From, State) ->
         end
     end),
     {reply, {ok, TaskId}, State};
-%% 直接执行 callFunction 工具
+
+%% 直接执行工具
 handle_call({run, Mod, Fun, Args}, _From, State) ->
-    Config = State#state.config,
-    SessionId = maps:get(sessionId, Config, State#state.defaultSession),
-    Result = alTools:execute(
-        callFunction,
-        #{module => Mod, function => Fun, args => Args},
-        Config,
-        SessionId
-    ),
-    {reply, Result, State};
-%% 用户确认后执行挂起的写/高风险操作
+    SessionId = maps:get(sessionId, effectiveConfig(State), State#state.defaultSession),
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    Result = alSessionWorker:run(WorkerPid, Mod, Fun, Args, effectiveConfig(State)),
+    {reply, Result, NewState};
+
+%% 批准/拒绝
 handle_call({approve, TaskId}, _From, State) ->
-    {Reply, NewState} = doApprove(TaskId, State),
+    {Reply, NewState} = delegatePending(TaskId, State, fun(Pid, Tid) ->
+        alSessionWorker:approve(Pid, Tid, effectiveConfig(State), State#state.mode,
+                                State#state.workingContext)
+    end),
     {reply, Reply, NewState};
+handle_call({dismiss, TaskId}, _From, State) ->
+    {Reply, NewState} = delegatePending(TaskId, State, fun(Pid, Tid) ->
+        alSessionWorker:dismiss(Pid, Tid, effectiveConfig(State), State#state.mode,
+                                State#state.workingContext)
+    end),
+    {reply, Reply, NewState};
+
+%% 挂起任务查询
+handle_call({pendingTask, TaskId}, _From, State) ->
+    Reply = lists:foldl(fun(Pid, Acc) ->
+        case Acc of
+            {ok, _} -> Acc;
+            _ -> alSessionWorker:pendingTask(Pid, TaskId)
+        end
+    end, {error, notFound}, maps:values(State#state.sessions)),
+    {reply, Reply, State};
+handle_call(pendingList, _From, State) ->
+    All = lists:flatmap(fun(Pid) -> alSessionWorker:pendingList(Pid) end,
+                        maps:values(State#state.sessions)),
+    {reply, All, State};
+
+%% 精准取消特定 taskId
+handle_call({cancelTask, SessionId, TaskId}, _From, State) ->
+    case maps:get(toBinary(SessionId), State#state.sessions, undefined) of
+        undefined -> {reply, {error, sessionNotFound}, State};
+        Pid -> {reply, alSessionWorker:cancelByTaskId(Pid, TaskId), State}
+    end;
+
+%% 内部：给 askAsync runner 获取 worker pid
+handle_call({getWorker, SessionId}, _From, State) ->
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    {reply, {ok, WorkerPid}, NewState};
+
 handle_call(status, _From, State) ->
     {reply, buildStatus(State), State};
 handle_call(sessions, _From, State) ->
-    SessionList = maps:map(fun(_Id, S) ->
-        #{
-            id => maps:get(id, S),
-            messageCount => length(maps:get(messages, S, [])),
-            createdAt => maps:get(createdAt, S),
-            updatedAt => maps:get(updatedAt, S)
-        }
+    SessionList = maps:map(fun(_Id, Pid) ->
+        alSessionWorker:snapshot(Pid)
     end, State#state.sessions),
     {reply, SessionList, State};
 handle_call(clearSession, _From, State) ->
-    Sid = State#state.defaultSession,
-    {reply, ok, resetSession(Sid, State)};
+    delegateDefault(State, fun(Pid) -> alSessionWorker:clearSession(Pid) end);
 handle_call({clearSession, SessionId}, _From, State) ->
-    {reply, ok, resetSession(SessionId, State)};
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    Reply = alSessionWorker:clearSession(WorkerPid),
+    {reply, Reply, NewState};
 handle_call(saveSession, _From, State) ->
     Sid = State#state.defaultSession,
-    {Reply, NewState} = doSaveSession(Sid, State),
-    {reply, Reply, NewState};
+    case maps:get(Sid, State#state.sessions, undefined) of
+        undefined -> {reply, {error, sessionNotFound}, State};
+        Pid -> {reply, alSessionWorker:saveSession(Pid, Sid), State}
+    end;
 handle_call({saveSession, SessionId}, _From, State) ->
-    {Reply, NewState} = doSaveSession(SessionId, State),
-    {reply, Reply, NewState};
+    case maps:get(toBinary(SessionId), State#state.sessions, undefined) of
+        undefined -> {reply, {error, sessionNotFound}, State};
+        Pid -> {reply, alSessionWorker:saveSession(Pid, toBinary(SessionId)), State}
+    end;
 handle_call({loadSession, SessionId}, _From, State) ->
-    {Reply, NewState} = doLoadSession(SessionId, State),
-    {reply, Reply, NewState};
+    BinId = toBinary(SessionId),
+    {WorkerPid, NewState} = ensureWorker(BinId, State),
+    Reply = alSessionWorker:loadSession(WorkerPid, BinId),
+    {reply, Reply, NewState#state{defaultSession = BinId}};
 handle_call({deleteSavedSession, SessionId}, _From, State) ->
     {reply, alSession:delete(toBinary(SessionId)), State};
 handle_call(savedSessions, _From, State) ->
     {reply, alSession:list(), State};
+handle_call({sessionMessages, SessionId}, _From, State) ->
+    case maps:get(toBinary(SessionId), State#state.sessions, undefined) of
+        undefined -> {reply, {error, sessionNotFound}, State};
+        Pid -> {reply, alSessionWorker:sessionMessages(Pid), State}
+    end;
+handle_call(cancelAsk, _From, State) ->
+    Results = [alSessionWorker:cancelAsk(Pid, all) || Pid <- maps:values(State#state.sessions)],
+    Total = lists:sum([maps:get(cancelled, R, 0) || R <- Results]),
+    {reply, #{ok => true, cancelled => Total}, State};
+handle_call({cancelAsk, SessionId}, _From, State) ->
+    case maps:get(toBinary(SessionId), State#state.sessions, undefined) of
+        undefined -> {reply, #{ok => true, cancelled => 0}, State};
+        Pid -> {reply, alSessionWorker:cancelAsk(Pid, all), State}
+    end;
 handle_call(getConfig, _From, State) ->
-    {reply, State#state.config, State};
+    {reply, effectiveConfig(State), State};
 handle_call({setConfig, Key, Value}, _From, State) ->
-    NewConfig = maps:put(Key, Value, State#state.config),
-    {reply, ok, State#state{config = NewConfig}};
+    NewOverrides = maps:put(Key, Value, State#state.runtimeOverrides),
+    NewState = case Key of
+        mode when Value =:= ask; Value =:= edit; Value =:= exec ->
+            State#state{runtimeOverrides = NewOverrides, mode = Value};
+        _ -> State#state{runtimeOverrides = NewOverrides}
+    end,
+    {reply, ok, NewState};
 handle_call(getMode, _From, State) ->
     {reply, State#state.mode, State};
 handle_call({setMode, Mode}, _From, State) ->
     Valid = case Mode of ask -> true; edit -> true; exec -> true; _ -> false end,
     case Valid of
-        true -> {reply, ok, State#state{mode = Mode}};
+        true ->
+            NewOverrides = maps:put(mode, Mode, State#state.runtimeOverrides),
+            {reply, ok, State#state{mode = Mode, runtimeOverrides = NewOverrides}};
         false -> {reply, {error, invalidMode}, State}
     end;
 handle_call(getWorkingContext, _From, State) ->
@@ -396,250 +370,117 @@ handle_call(clearContext, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknownRequest}, State}.
 
+%% Web SSE/WS 流式问答：不阻塞 alServer，由 session worker 向 Caller 推送分块。
 handle_cast({askStreamAsync, Prompt, Opts, Caller}, State) ->
-    doAskAsync(Prompt, Opts, State, undefined, Caller),
-    {noreply, State};
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-%% alTask worker 完成通知（由 askAsync 路径产生，此处仅忽略）
-handle_info({alTask, _TaskId, _Result}, State) ->
-    {noreply, State};
-%% ask worker 完成：更新会话并 reply 等待中的 gen_server:call
-handle_info({askResult, Ref, RunResult, SessionId}, State) ->
-    case maps:take(Ref, State#state.pendingAsks) of
-        {{From, _Sid}, NewPending} ->
-            {Reply, NewState} = handleAskResult(RunResult, SessionId, State),
-            gen_server:reply(From, Reply),
-            {noreply, NewState#state{pendingAsks = NewPending}};
-        error ->
-            {noreply, State}
-    end;
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%% 异步执行 ask，不阻塞 gen_server 邮箱。
-%% 启动 worker 进程执行 LLM 调用，通过 gen_server:reply 异步返回结果。
-%% @param StreamPid undefined 为同步模式；Pid 为流式输出目标进程
-doAskAsync(Prompt, Opts, State, From, StreamPid) ->
-    Config = mergeAskConfig(State#state.config, Opts),
     SessionId = maps:get(sessionId, Opts, State#state.defaultSession),
-    AskConfig = applySessionTuning(Config#{
-        mode => State#state.mode,
-        workingContext => State#state.workingContext
-    }, SessionId),
-    emit_progress(AskConfig, #{
-        type => step,
-        phase => prepare,
-        message => <<"准备会话与系统提示..."/utf8>>
-    }),
-    {Session, State1} = ensureSession(SessionId, State),
-    History = maps:get(messages, Session, []),
-    Messages = alContext:buildMessages(AskConfig, History, Prompt),
-    emit_progress(AskConfig, #{
-        type => step,
-        phase => ready,
-        message => <<"上下文就绪，开始推理..."/utf8>>
-    }),
-    Model = maps:get(model, AskConfig, <<"gpt-4o-mini"/utf8>>),
-    Server = self(),
-    Ref = make_ref(),
-    spawn(fun() ->
-        RunResult = case StreamPid of
-            undefined ->
-                alLoop:run(Model, Messages, AskConfig, SessionId);
-            Pid ->
-                alLoop:runStream(Model, Messages, AskConfig, SessionId, Pid)
-        end,
-        Server ! {askResult, Ref, RunResult, SessionId}
-    end),
-    PendingAsks = maps:put(Ref, {From, SessionId}, State1#state.pendingAsks),
-    {noreply, State1#state{pendingAsks = PendingAsks}}.
+    {WorkerPid, NewState} = ensureWorker(SessionId, State),
+    alSessionWorker:askStream(WorkerPid, undefined, Prompt, Opts, Caller,
+                              effectiveConfig(State), State#state.mode, State#state.workingContext),
+    {noreply, NewState};
+handle_cast(refreshConfig, State) ->
+    Config = effectiveConfig(State),
+    _ = try alCodeIndexer:refresh(Config) catch _:_ -> ok end,
+    {noreply, State};
+handle_cast(_Msg, State) -> {noreply, State}.
 
-%% 处理 alLoop 返回结果：更新会话消息，或登记待确认任务
-handleAskResult(RunResult, SessionId, State) ->
-    Session = maps:get(SessionId, State#state.sessions, newSession(SessionId)),
-    case RunResult of
-        {ok, Answer, UpdatedMessages} ->
-            Now = erlang:system_time(millisecond),
-            Conversation = alContext:conversationHistory(UpdatedMessages),
-            NewSession = Session#{
-                messages => Conversation,
-                updatedAt => Now
-            },
-            Sessions = maps:put(SessionId, NewSession, State#state.sessions),
-            {{ok, Answer}, State#state{sessions = Sessions}};
-        {pending, Pending, UpdatedMessages} ->
-            TaskId = maps:get(taskId, Pending),
-            Now = erlang:system_time(millisecond),
-            Conversation = alContext:conversationHistory(UpdatedMessages),
-            NewSession = Session#{
-                messages => Conversation,
-                updatedAt => Now
-            },
-            PendingTasks = maps:put(TaskId, Pending, State#state.pendingTasks),
-            Sessions = maps:put(SessionId, NewSession, State#state.sessions),
-            Msg = iolist_to_binary([
-                <<"Operation requires confirmation. TaskId: "/utf8>>,
-                TaskId,
-                <<". Call ali:approve(\""/utf8>>, TaskId, <<"\") to proceed."/utf8>>
-            ]),
-            {{ok, Msg}, State#state{sessions = Sessions, pendingTasks = PendingTasks}};
-        {error, Reason} ->
-            {{error, Reason}, State}
-    end.
+handle_info(_Info, State) -> {noreply, State}.
 
-%% 将内存会话写入磁盘
-doSaveSession(SessionId, State) ->
+terminate(_Reason, _State) -> ok.
+
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+%%%===================================================================
+%%% 内部
+%%%===================================================================
+
+%% 按需启动 session worker（若已存在则复用）
+ensureWorker(SessionId, State) ->
     BinId = toBinary(SessionId),
     case maps:get(BinId, State#state.sessions, undefined) of
+        Pid when is_pid(Pid) ->
+            {Pid, State};
         undefined ->
-            {{error, sessionNotFound}, State};
-        Session ->
-            case alSession:save(BinId, Session) of
-                ok -> {{ok, ok}, State};
-                {error, Reason} -> {{error, Reason}, State}
-            end
+            {ok, Pid} = alSessionWorker:start_link(BinId, #{}),
+            NewSessions = maps:put(BinId, Pid, State#state.sessions),
+            {Pid, State#state{sessions = NewSessions}}
     end.
 
-%% 从磁盘加载会话到内存并设为默认会话
-doLoadSession(SessionId, State) ->
-    BinId = toBinary(SessionId),
-    case alSession:load(BinId) of
-        {ok, Session} ->
-            Sessions = maps:put(BinId, Session, State#state.sessions),
-            {{ok, ok}, State#state{sessions = Sessions, defaultSession = BinId}};
-        {error, Reason} ->
-            {{error, Reason}, State}
+%% 对默认会话执行操作
+delegateDefault(State, Fun) ->
+    case maps:get(State#state.defaultSession, State#state.sessions, undefined) of
+        undefined -> {reply, ok, State};
+        Pid -> {reply, Fun(Pid), State}
     end.
 
-%% 执行用户已批准的挂起工具调用
-doApprove(TaskId, State) ->
+%% approve/dismiss 委托：在所有 worker 中查找持有该 task 的 worker
+delegatePending(TaskId, State, Fun) ->
     BinId = toBinary(TaskId),
-    case maps:get(BinId, State#state.pendingTasks, undefined) of
-        undefined ->
-            {{error, taskNotFound}, State};
-        Pending ->
-            Tool = maps:get(tool, Pending),
-            Args = maps:get(args, Pending),
-            SessionId = maps:get(sessionId, Pending),
-            Config = State#state.config,
-            Context = #{confirmed => true},
-            case alTools:execute(Tool, Args, Config, SessionId, Context) of
-                {ok, Result} ->
-                    PendingTasks = maps:remove(BinId, State#state.pendingTasks),
-                    {{ok, Result}, State#state{pendingTasks = PendingTasks}};
-                {error, Reason} ->
-                    {{error, Reason}, State}
-            end
+    FindResult = lists:foldl(fun(Pid, Acc) ->
+        case Acc of
+            found -> found;
+            _ ->
+                case alSessionWorker:pendingTask(Pid, BinId) of
+                    {ok, _} -> {ok, Pid};
+                    _ -> Acc
+                end
+        end
+    end, not_found, maps:values(State#state.sessions)),
+    case FindResult of
+        {ok, Pid} ->
+            Reply = Fun(Pid, BinId),
+            {Reply, State};
+        not_found ->
+            {{error, taskNotFound}, State}
     end.
 
-%% 确保会话存在于 state.sessions 中，不存在则创建
-ensureSession(SessionId, State) ->
-    case maps:get(SessionId, State#state.sessions, undefined) of
-        undefined ->
-            Session = newSession(SessionId),
-            Sessions = maps:put(SessionId, Session, State#state.sessions),
-            {Session, State#state{sessions = Sessions}};
-        Session ->
-            {Session, State}
-    end.
-
-%% 重置指定会话为空消息历史
-resetSession(SessionId, State) ->
-    Session = newSession(SessionId),
-    Sessions = maps:put(SessionId, Session, State#state.sessions),
-    State#state{sessions = Sessions}.
-
-%% 创建新的空会话记录
-newSession(SessionId) ->
-    Now = erlang:system_time(millisecond),
-    #{
-        id => SessionId,
-        messages => [],
-        createdAt => Now,
-        updatedAt => Now
-    }.
-
-%% 组装 status/0 返回的状态 map
 buildStatus(State) ->
+    Config = effectiveConfig(State),
+    Snapshots = [alSessionWorker:snapshot(Pid) || {_, Pid} <- maps:to_list(State#state.sessions)],
+    PendingTaskCount = lists:sum([maps:get(pendingTaskCount, S, 0) || S <- Snapshots]),
     #{
         running => true,
         node => node(),
         sessionCount => maps:size(State#state.sessions),
-        pendingTaskCount => maps:size(State#state.pendingTasks),
+        pendingTaskCount => PendingTaskCount,
         savedSessionCount => length(alSession:list()),
         asyncTaskCount => length(alTask:list()),
-        projectRoot => maps:get(projectRoot, State#state.config, undefined),
-        model => maps:get(model, State#state.config, undefined),
-        useNativeTools => maps:get(useNativeTools, State#state.config, true),
+        projectRoot => maps:get(projectRoot, Config, undefined),
+        model => maps:get(model, Config, undefined),
+        useNativeTools => maps:get(useNativeTools, Config, true),
         toolCount => length(alTools:listTools()),
         mode => State#state.mode,
-        indexStats => alCodeIndexer:get_stats(),
+        indexStats => alCodeIndexer:getStats(),
         workingContext => State#state.workingContext
     }.
 
-%% 构建默认 Agent 配置（项目根、模型、步数上限、策略等）
 defaultConfig() ->
     Root = case alToolProject:findProjectRootFromModule() of
-        R when is_list(R) -> list_to_binary(R);
+        R when is_list(R) -> llmJson:text(R);
         R when is_binary(R) -> R;
         _ ->
             case file:get_cwd() of
-                {ok, Cwd} -> list_to_binary(Cwd);
+                {ok, Cwd} -> llmJson:text(Cwd);
                 {error, _} -> <<"."/utf8>>
             end
     end,
     #{
         projectRoot => Root,
-        model => <<"gpt-4o-mini"/utf8>>,
+        model => ?DEFAULT_MODEL,
         maxSteps => 25,
         maxMessages => 40,
         useNativeTools => true,
         policy => alPolicy:defaultPolicy(),
         modelOptions => [{temperature, 0.2}],
-        execTimeout => 60000
+        execTimeout => 60000,
+        toolTimeout => alConfig:get(toolTimeout),
+        maxToolContent => alConfig:get(maxToolContent),
+        llmMaxRetries => 2,
+        historyCompaction => true
     }.
 
-%% 将 ask 调用时的 Opts 合并到基础 Config
-mergeAskConfig(Config, Opts) when is_map(Opts) ->
-    maps:merge(Config, Opts);
-mergeAskConfig(Config, Opts) when is_list(Opts) ->
-    maps:merge(Config, maps:from_list(Opts)).
-
-%% 按会话 ID 微调配置（如 web 会话提高 maxSteps）
-applySessionTuning(Config, SessionId) ->
-    case SessionId of
-        <<"web"/utf8>> ->
-            Steps = maps:get(maxSteps, Config, 25),
-            Config#{maxSteps => max(Steps, 40)};
-        _ ->
-            Config
-    end.
-
-%% 若 Opts 含 progressId 则向 alProgress 发送进度事件
-emit_progress(Config, Event) ->
-    case maps:get(progressId, Config, undefined) of
-        undefined -> ok;
-        Id -> alProgress:emit(Id, Event)
-    end.
-
-%% 将 binary、list 或其他 term 统一转为 binary
-toBinary(X) when is_binary(X) -> X;
-toBinary(X) when is_list(X) -> unicode:characters_to_binary(X);
-toBinary(X) -> unicode:characters_to_binary(io_lib:format("~p", [X])).
-
-%% 返回空的工作上下文结构
 defaultWorkingContext() ->
     #{modules => [], files => [], processes => []}.
 
-%% 将 module/file/process 类型（atom 或 binary）映射为上下文 map 的键
 context_key(module) -> modules;
 context_key(file) -> files;
 context_key(process) -> processes;
@@ -648,3 +489,14 @@ context_key(<<"file"/utf8>>) -> files;
 context_key(<<"process"/utf8>>) -> processes;
 context_key(T) when is_atom(T) -> T;
 context_key(T) when is_binary(T) -> binary_to_atom(T, utf8).
+
+toBinary(X) when is_binary(X) -> X;
+toBinary(X) when is_list(X) -> unicode:characters_to_binary(X);
+toBinary(X) -> unicode:characters_to_binary(io_lib:format("~p", [X])).
+
+effectiveConfig(State) ->
+    effectiveConfig(State#state.runtimeOverrides, State#state.mode).
+
+effectiveConfig(Overrides, Mode) ->
+    Base = maps:merge(defaultConfig(), alConfig:getAgentConfig()),
+    maps:merge(Base, maps:merge(Overrides, #{mode => Mode})).

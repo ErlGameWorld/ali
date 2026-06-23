@@ -11,6 +11,8 @@
 -export([
     codeIndex/2,
     searchCodeIndex/2,
+    searchCode/2,
+    semanticSearch/2,
     getFunctionSource/2,
     analyzeCalls/2,
     findCallers/2,
@@ -32,10 +34,69 @@ codeIndex(Args, Config) ->
     case Force of
         true -> alCodeIndexer:refresh(Config);
         false ->
-            Stats = alCodeIndexer:get_stats(),
+            Stats = alCodeIndexer:getStats(),
             case maps:get(moduleCount, Stats, 0) of
                 0 -> alCodeIndexer:refresh(Config);
                 _ -> {ok, Stats#{cached => true}}
+            end
+    end.
+
+%% @doc 语义/关键词检索：按自然语言查询返回最相关的函数代码片段（TF-IDF）。
+%% Args: `query`（必填）、`limit`（默认 5）、`reindex`（true 时强制重建语料）。
+-spec searchCode(map(), map()) -> {ok, map()} | {error, term()}.
+searchCode(Args, Config) ->
+    case maps:get(query, Args, undefined) of
+        undefined ->
+            {error, missingQuery};
+        Query ->
+            case maps:get(reindex, Args, false) of
+                true -> alRag:index(Config);
+                false -> ok
+            end,
+            Limit = maps:get(limit, Args, 5),
+            {ok, Results} = alRag:search(Query, #{limit => Limit}, Config),
+            {ok, #{query => to_binary(Query), count => length(Results), results => Results}}
+    end.
+
+%% @doc 向量语义检索：强制使用混合（向量+TF-IDF）模式，适合自然语言查询。
+%% 当 embedding 不可用时自动降级为 TF-IDF。
+%% Args: `query`（必填）、`limit`（默认 5）、`reindex`（true 时强制重建语料）、
+%%       `vectorWeight`/`tfidfWeight`（融合权重，默认 0.6/0.4）。
+-spec semanticSearch(map(), map()) -> {ok, map()} | {error, term()}.
+semanticSearch(Args, Config) ->
+    case maps:get(query, Args, undefined) of
+        undefined ->
+            {error, missingQuery};
+        Query ->
+            case maps:get(reindex, Args, false) of
+                true -> alRag:index(Config);
+                false -> ok
+            end,
+            Limit = maps:get(limit, Args, 5),
+            Opts = #{
+                limit => Limit,
+                vectorWeight => maps:get(vectorWeight, Args, 0.6),
+                tfidfWeight => maps:get(tfidfWeight, Args, 0.4)
+            },
+            Mode = alRag:mode(),
+            case Mode of
+                hybrid ->
+                    {ok, Results} = alRag:searchHybrid(Query, Opts, Config),
+                    {ok, #{
+                        query => to_binary(Query),
+                        count => length(Results),
+                        mode => hybrid,
+                        results => Results
+                    }};
+                tfidf ->
+                    %% embedding 不可用，降级为 TF-IDF
+                    {ok, Results} = alRag:search(Query, Opts, Config),
+                    {ok, #{
+                        query => to_binary(Query),
+                        count => length(Results),
+                        mode => tfidf,
+                        results => Results
+                    }}
             end
     end.
 
@@ -50,7 +111,7 @@ searchCodeIndex(Args, Config) ->
             {error, missingQuery};
         _ ->
             Q = to_binary(Query),
-            FunMatches = [M#{kind => function} || M <- alCodeIndexer:search_functions(Q)],
+            FunMatches = [M#{kind => function} || M <- alCodeIndexer:searchFunctions(Q)],
             ModMatches = search_modules_by_name(Q),
             Combined = dedupe_index_matches(FunMatches ++ ModMatches, MaxResults),
             {ok, #{
@@ -65,7 +126,7 @@ search_modules_by_name(Query) ->
     lists:filtermap(fun(Mod) ->
         case string:str(string:lowercase(atom_to_list(Mod)), Q) > 0 of
             true ->
-                Entry = case alCodeIndexer:lookup_module(Mod) of
+                Entry = case alCodeIndexer:lookupModule(Mod) of
                     {ok, E} -> E;
                     _ -> #{}
                 end,
@@ -77,7 +138,7 @@ search_modules_by_name(Query) ->
             false ->
                 false
         end
-    end, alCodeIndexer:all_modules()).
+    end, alCodeIndexer:allModules()).
 
 dedupe_index_matches(Matches, Max) ->
     dedupe_index_matches(Matches, Max, [], sets:new()).
@@ -119,7 +180,7 @@ getFunctionSource(Args, Config) ->
 
 %% 从索引中定位函数并读取对应源码行范围。
 fetch_function_source(Mod, Fun, Arity) ->
-    case alCodeIndexer:lookup_module(Mod) of
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, Entry} ->
             Funs = maps:get(functions, Entry, []),
             Match = pick_function(Funs, Fun, Arity),
@@ -198,10 +259,10 @@ analyzeCalls(Args, Config) ->
         {undefined, _} -> {error, missingModule};
         {_, undefined} -> {error, missingFunction};
         _ ->
-            case alCodeIndexer:lookup_module(Mod) of
+            case alCodeIndexer:lookupModule(Mod) of
                 {ok, Entry} ->
                     Path = maps:get(absPath, Entry),
-                    case alAst:function_calls(Path, Mod, Fun, Arity) of
+                    case alAst:functionCalls(Path, Mod, Fun, Arity) of
                         {ok, Calls} ->
                             {ok, #{
                                 module => Mod,
@@ -267,7 +328,7 @@ findCallers(Args, Config) ->
         {undefined, _} -> {error, missingModule};
         {_, undefined} -> {error, missingFunction};
         _ ->
-            Callers = alAst:find_callers(Mod, Fun),
+            Callers = alAst:findCallers(Mod, Fun),
             {ok, #{
                 module => Mod,
                 function => Fun,
@@ -316,7 +377,7 @@ analyzeBehaviours(Args, Config) ->
     Mod = maps:get(module, Args, undefined),
     case Mod of
         undefined ->
-            All = alCodeIndexer:all_modules(),
+            All = alCodeIndexer:allModules(),
             Entries = [behaviour_entry(M) || M <- All],
             With = [E || E <- Entries, maps:get(behaviourCount, E, 0) > 0],
             {ok, #{count => length(With), modules => With}};
@@ -327,7 +388,7 @@ analyzeBehaviours(Args, Config) ->
 
 %% 构建单个模块的 behaviour 摘要条目。
 behaviour_entry(Mod) ->
-    case alCodeIndexer:lookup_module(Mod) of
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, Entry} ->
             #{
                 module => Mod,
@@ -347,7 +408,7 @@ moduleDependencies(Args, Config) ->
     case Mod of
         undefined -> {error, missingModule};
         _ ->
-            case alCodeIndexer:lookup_module(Mod) of
+            case alCodeIndexer:lookupModule(Mod) of
                 {ok, Entry} ->
                     Imports = maps:get(imports, Entry, []),
                     Modules = lists:usort([M || M <- Imports, is_atom(M)] ++
@@ -366,7 +427,7 @@ moduleDependencies(Args, Config) ->
 -spec dependencyGraph(map(), map()) -> {ok, map()} | {error, term()}.
 dependencyGraph(_Args, Config) ->
     _ = ensure_index(Config),
-    Edges = alCodeIndexer:module_graph(),
+    Edges = alCodeIndexer:moduleGraph(),
     Mermaid = graph_to_mermaid(Edges),
     {ok, #{
         edgeCount => length(Edges),
@@ -388,7 +449,7 @@ analyzeCallGraph(Args, Config) ->
     case Mod of
         undefined -> {error, missingModule};
         _ ->
-            Edges = alAst:call_graph_edges(Mod),
+            Edges = alAst:callGraphEdges(Mod),
             {ok, #{
                 module => Mod,
                 edgeCount => length(Edges),
@@ -403,7 +464,7 @@ codeQuality(Args, Config) ->
     _ = ensure_index(Config),
     Mod = maps:get(module, Args, undefined),
     Modules = case Mod of
-        undefined -> alCodeIndexer:all_modules();
+        undefined -> alCodeIndexer:allModules();
         _ -> [to_atom(Mod)]
     end,
     Issues = lists:flatmap(fun analyze_module_quality/1, Modules),
@@ -414,7 +475,7 @@ codeQuality(Args, Config) ->
 
 %% 对单个模块收集质量 issue 列表。
 analyze_module_quality(Mod) ->
-    case alCodeIndexer:lookup_module(Mod) of
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, Entry} ->
             Exports = maps:get(exports, Entry, []),
             Funs = maps:get(functions, Entry, []),
@@ -463,8 +524,10 @@ truncate_term(Term) ->
 %% 将 binary/list/atom 统一转为 atom。
 to_atom(undefined) -> undefined;
 to_atom(X) when is_atom(X) -> X;
-to_atom(X) when is_binary(X) -> binary_to_atom(X, utf8);
-to_atom(X) when is_list(X) -> list_to_atom(X).
+to_atom(X) when is_binary(X) ->
+    try binary_to_existing_atom(X, utf8) catch _:_ -> undefined end;
+to_atom(X) when is_list(X) ->
+    try list_to_existing_atom(X) catch _:_ -> undefined end.
 
 to_binary(X) when is_binary(X) -> X;
 to_binary(X) when is_list(X) -> unicode:characters_to_binary(X);

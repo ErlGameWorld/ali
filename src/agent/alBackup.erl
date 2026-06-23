@@ -16,8 +16,10 @@
     backup_file/1,
     backup_file/2,
     list_backups/1,
+    list_session_backups/1,
     restore/1,
     restore_latest/1,
+    restore_session/1,
     cleanup/0,
     cleanup/1
 ]).
@@ -152,6 +154,87 @@ restore_latest(AbsPath) ->
         [] -> {error, no_backup}
     end.
 
+%% @doc 列出指定会话 ID 的所有备份记录（按时间升序）。
+%% 通过 meta 文件中的 sessionId 字段过滤。
+%% @param SessionId 会话标识（binary 或 string）
+%% @returns `[map()]' 每项含 timestamp、backupPath、original 等字段
+-spec list_session_backups(binary() | string()) -> [map()].
+list_session_backups(SessionId) ->
+    SidBin = to_binary(SessionId),
+    Dir = backup_dir(),
+    case filelib:is_dir(Dir) of
+        false -> [];
+        true ->
+            TsDirs = filelib:wildcard(filename:join(Dir, "*")),
+            lists:sort(fun(A, B) ->
+                maps:get(timestamp, A, <<>>) =< maps:get(timestamp, B, <<>>)
+            end, lists:filtermap(fun(D) ->
+                case session_backup_entry(D, SidBin) of
+                    undefined -> false;
+                    E -> {true, E}
+                end
+            end, TsDirs))
+    end.
+
+%% 从时间戳目录中查找匹配 sessionId 的备份记录。
+session_backup_entry(TsDir, SidBin) ->
+    MetaFiles = filelib:wildcard(filename:join(TsDir, "*.meta")),
+    case MetaFiles of
+        [] -> undefined;
+        [MF | _] ->
+            Meta = read_meta(MF),
+            MetaSid = maps:get(<<"sessionId"/utf8>>, Meta, maps:get(sessionId, Meta, undefined)),
+            case MetaSid =:= SidBin of
+                true ->
+                    Base = filename:basename(MF, ".meta"),
+                    File = filename:join(TsDir, Base),
+                    Original = maps:get(<<"original"/utf8>>, Meta,
+                        maps:get(original, Meta, undefined)),
+                    #{
+                        timestamp => filename:basename(TsDir),
+                        backupPath => File,
+                        original => to_list(Original),
+                        meta => Meta
+                    };
+                false ->
+                    undefined
+            end
+    end.
+
+%% @doc 会话级回滚：将指定会话中修改的所有文件恢复到会话开始前的状态。
+%% 对每个唯一文件，恢复该会话中最早的一份备份（即修改前的快照）。
+%% @param SessionId 会话标识
+%% @returns `{ok, map()}' 含 restored 文件列表与 errors；或 `{error, term()}'
+-spec restore_session(binary() | string()) -> {ok, map()} | {error, term()}.
+restore_session(SessionId) ->
+    Backups = list_session_backups(SessionId),
+    case Backups of
+        [] ->
+            {ok, #{restored => [], errors => [], message => <<"No backups found for this session"/utf8>>}};
+        _ ->
+            %% 按原始路径分组，每组取最早的备份（列表已按时间升序）
+            Grouped = lists:foldl(fun(B, Acc) ->
+                Orig = maps:get(original, B),
+                maps:update_with(Orig, fun(V) -> V ++ [B] end, [B], Acc)
+            end, #{}, Backups),
+            {Restored, Errors} = maps:fold(fun(Orig, BList, {RAcc, EAcc}) ->
+                case BList of
+                    [Earliest | _] ->
+                        BP = maps:get(backupPath, Earliest),
+                        case file:copy(BP, Orig) of
+                            {ok, _} -> {[Orig | RAcc], EAcc};
+                            {error, Reason} -> {RAcc, [#{path => Orig, error => Reason} | EAcc]}
+                        end
+                end
+            end, {[], []}, Grouped),
+            {ok, #{
+                restored => lists:reverse(Restored),
+                errors => lists:reverse(Errors),
+                sessionId => to_binary(SessionId),
+                fileCount => length(Restored)
+            }}
+    end.
+
 %% @doc 清理所有超出默认上限（50 份/文件）的旧备份。
 %% @returns `ok`
 -spec cleanup() -> ok.
@@ -229,3 +312,8 @@ delete_dir(Dir) ->
 %% 将 binary 或 list 统一转为 string
 to_list(X) when is_list(X) -> X;
 to_list(X) when is_binary(X) -> binary_to_list(X).
+
+%% 将 list 或 binary 统一转为 binary
+to_binary(X) when is_binary(X) -> X;
+to_binary(X) when is_list(X) -> unicode:characters_to_binary(X);
+to_binary(X) when is_atom(X) -> atom_to_binary(X, utf8).

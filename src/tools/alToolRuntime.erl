@@ -18,6 +18,9 @@
     remoteNodeInfo/2,
     runtimeSummary/2,
     agentConfig/2,
+    topProcesses/2,
+    schedulerInfo/2,
+    etsTables/2,
     nodeSummary/1
 ]).
 
@@ -109,10 +112,10 @@ nodeInfo(_Args, _Config) ->
 %% @doc 返回 Agent LLM 配置（经 sanitize）及格式化文本。
 -spec agentConfig(map(), map()) -> {ok, map()}.
 agentConfig(_Args, _Config) ->
-    C = llmCliConfig:getAgentConfig(),
+    C = alConfig:getAgentConfig(),
     {ok, #{
         config => llmJson:sanitize(C),
-        formatted => llmCliConfig:formatAgentConfig()
+        formatted => alConfig:formatAgentConfig()
     }}.
 
 %% @doc 聚合节点、应用、进程采样、注册名与 memory 的运行时总览。
@@ -133,6 +136,113 @@ runtimeSummary(Args, Config) ->
         registeredNames => lists:sublist(maps:get(names, Regs), 30),
         memory => Mem
     })}.
+
+%% @doc 按指标（memory / reductions / message_queue_len）排序的 Top 进程，
+%% 用于快速定位内存大户、CPU 热点或消息队列堆积的进程。
+-spec topProcesses(map(), map()) -> {ok, map()} | {error, term()}.
+topProcesses(Args, _Config) ->
+    By = normalizeMetric(maps:get(by, Args, memory)),
+    Limit = maps:get(limit, Args, 10),
+    case By of
+        undefined ->
+            {error, invalidMetric};
+        Metric ->
+            Scored = lists:filtermap(fun(Pid) ->
+                case erlang:process_info(Pid, Metric) of
+                    {Metric, Value} when is_integer(Value) -> {true, {Value, Pid}};
+                    _ -> false
+                end
+            end, erlang:processes()),
+            Sorted = lists:reverse(lists:sort(Scored)),
+            Top = [describeTopProcess(Pid, Metric, Value)
+                   || {Value, Pid} <- lists:sublist(Sorted, Limit)],
+            {ok, #{
+                metric => Metric,
+                processCount => length(Scored),
+                top => Top
+            }}
+    end.
+
+%% @doc 调度器、运行队列、归约数与内存分布概览。
+-spec schedulerInfo(map(), map()) -> {ok, map()}.
+schedulerInfo(_Args, _Config) ->
+    {TotalReds, _} = erlang:statistics(reductions),
+    {ok, #{
+        schedulers => erlang:system_info(schedulers),
+        schedulersOnline => erlang:system_info(schedulers_online),
+        dirtyCpuSchedulers => erlang:system_info(dirty_cpu_schedulers),
+        runQueue => erlang:statistics(run_queue),
+        totalRunQueueLengths => safeStat(total_run_queue_lengths_all),
+        totalReductions => TotalReds,
+        processCount => erlang:system_info(process_count),
+        portCount => erlang:system_info(port_count),
+        atomCount => safeSystemInfo(atom_count),
+        memory => [{K, V} || {K, V} <- erlang:memory()]
+    }}.
+
+%% @doc 列出节点上 ETS 表及 memory/size/type 等（无需 callFunction + ets:info/1）。
+-spec etsTables(map(), map()) -> {ok, map()}.
+etsTables(Args, _Config) ->
+    Limit = maps:get(limit, Args, 100),
+    Rows = lists:filtermap(fun(Tid) ->
+        case tableRow(Tid) of
+            undefined -> false;
+            Row -> {true, Row}
+        end
+    end, ets:all()),
+    Sorted = lists:sort(fun compareTableMemory/2, Rows),
+    Shown = lists:sublist(Sorted, Limit),
+    {ok, #{
+        count => length(Rows),
+        truncated => length(Rows) > Limit,
+        totalEtsMemory => erlang:memory(ets),
+        tables => Shown
+    }}.
+
+tableRow(Tid) ->
+    case ets:info(Tid) of
+        undefined ->
+            undefined;
+        Info ->
+            #{
+                name => proplists:get_value(name, Info),
+                size => proplists:get_value(size, Info),
+                memory => proplists:get_value(memory, Info),
+                type => proplists:get_value(type, Info),
+                protection => proplists:get_value(protection, Info),
+                namedTable => proplists:get_value(named_table, Info),
+                keypos => proplists:get_value(keypos, Info)
+            }
+    end.
+
+compareTableMemory(#{memory := A}, #{memory := B}) when A >= B -> true;
+compareTableMemory(_, _) -> false.
+
+%% 归一化排序指标参数。
+normalizeMetric(M) when is_binary(M) -> normalizeMetric(binary_to_list(M));
+normalizeMetric(M) when is_list(M) -> normalizeMetric(list_to_atom(M));
+normalizeMetric(memory) -> memory;
+normalizeMetric(reductions) -> reductions;
+normalizeMetric(message_queue_len) -> message_queue_len;
+normalizeMetric(messageQueueLen) -> message_queue_len;
+normalizeMetric(_) -> undefined.
+
+%% 构建 Top 进程描述项。
+describeTopProcess(Pid, Metric, Value) ->
+    Extra = erlang:process_info(Pid, [registered_name, current_function, initial_call]),
+    Base = #{pid => iolist_to_binary(pid_to_list(Pid)), Metric => Value},
+    case Extra of
+        undefined -> Base;
+        _ -> maps:merge(Base, maps:from_list(Extra))
+    end.
+
+%% 安全调用 erlang:statistics/1（部分项旧版本不支持）。
+safeStat(Key) ->
+    try erlang:statistics(Key) catch _:_ -> undefined end.
+
+%% 安全调用 erlang:system_info/1。
+safeSystemInfo(Key) ->
+    try erlang:system_info(Key) catch _:_ -> undefined end.
 
 %% @doc 通过 RPC 获取已连接远程节点的 nodeSummary。
 -spec remoteNodeInfo(map(), map()) -> {ok, map()} | {error, term()}.

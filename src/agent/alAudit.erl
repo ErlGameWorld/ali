@@ -14,6 +14,8 @@
     log/4,
     list/0,
     list/1,
+    query/1,
+    stats/0,
     clear/0,
     formatEntry/1
 ]).
@@ -95,15 +97,78 @@ list() ->
 
 %% @doc 返回最近 Limit 条审计记录（按 at 字段降序）。
 %% @param Limit 最大返回条数
-%% @returns `[map()]`
+%% @returns `[map()]'
 -spec list(non_neg_integer()) -> [map()].
 list(Limit) ->
     init(),
-    All = ets:tab2list(?TABLE),
-    Sorted = lists:sort(fun({_, A}, {_, B}) ->
-        maps:get(at, A, 0) >= maps:get(at, B, 0)
-    end, All),
-    lists:sublist([Entry || {_, Entry} <- Sorted], Limit).
+    %% 利用 ordered_set 的键序（单调递增）从尾向前遍历，避免 ets:tab2list 全量复制。
+    collectRecent(Limit, ets:last(?TABLE), []).
+
+%% @doc 按条件检索审计记录。
+%% Filters 可含：`tool`（atom）、`sessionId`（binary）、`since`（毫秒时间戳）、
+%% `limit`（默认 100）。结果按时间降序。
+-spec query(map()) -> [map()].
+query(Filters) ->
+    init(),
+    Limit = maps:get(limit, Filters, 100),
+    Tool = maps:get(tool, Filters, undefined),
+    Session = maps:get(sessionId, Filters, undefined),
+    Since = maps:get(since, Filters, undefined),
+    %% 从 ordered_set 尾端向前遍历并过滤，命中 Limit 条即停，避免全表加载。
+    collectFiltered(Limit, Tool, Session, Since, ets:last(?TABLE), []).
+
+%% @doc 审计统计：总条目数、按工具分组的调用次数与失败次数。
+-spec stats() -> map().
+stats() ->
+    init(),
+    %% 用 ets:foldl 直接聚合，不构造完整列表。
+    ByTool = ets:foldl(fun({_Key, E}, Acc) ->
+        T = maps:get(tool, E, unknown),
+        Prev = maps:get(T, Acc, #{calls => 0, errors => 0}),
+        IsErr = maps:get(ok, maps:get(result, E, #{}), true) =:= false,
+        Acc#{T => #{
+            calls => maps:get(calls, Prev) + 1,
+            errors => maps:get(errors, Prev) + case IsErr of true -> 1; false -> 0 end
+        }}
+    end, #{}, ?TABLE),
+    #{total => ets:info(?TABLE, size), byTool => ByTool}.
+
+%% 从 ordered_set 尾端向前收集最近 N 条记录（按插入时间降序）。
+collectRecent(0, _, Acc) -> lists:reverse(Acc);
+collectRecent(_, '$end_of_table', Acc) -> lists:reverse(Acc);
+collectRecent(N, Key, Acc) ->
+    case ets:lookup(?TABLE, Key) of
+        [{Key, Entry}] ->
+            collectRecent(N - 1, ets:prev(?TABLE, Key), [Entry | Acc]);
+        [] ->
+            collectRecent(N, ets:prev(?TABLE, Key), Acc)
+    end.
+
+%% 从 ordered_set 尾端向前过滤并收集最多 Limit 条记录。
+collectFiltered(0, _, _, _, _, Acc) -> lists:reverse(Acc);
+collectFiltered(_, _, _, _, '$end_of_table', Acc) -> lists:reverse(Acc);
+collectFiltered(N, Tool, Session, Since, Key, Acc) ->
+    case ets:lookup(?TABLE, Key) of
+        [{Key, Entry}] ->
+            case matchField(Tool, maps:get(tool, Entry, undefined))
+                 andalso matchField(Session, maps:get(sessionId, Entry, undefined))
+                 andalso matchSince(Since, maps:get(at, Entry, 0)) of
+                true ->
+                    collectFiltered(N - 1, Tool, Session, Since, ets:prev(?TABLE, Key), [Entry | Acc]);
+                false ->
+                    collectFiltered(N, Tool, Session, Since, ets:prev(?TABLE, Key), Acc)
+            end;
+        [] ->
+            collectFiltered(N, Tool, Session, Since, ets:prev(?TABLE, Key), Acc)
+    end.
+
+%% 字段匹配：undefined 表示不过滤。
+matchField(undefined, _) -> true;
+matchField(Want, Have) -> Want =:= Have.
+
+%% 时间下界匹配。
+matchSince(undefined, _) -> true;
+matchSince(Since, At) -> At >= Since.
 
 %% @doc 清空内存中的全部审计条目（不删除磁盘 JSONL 文件）。
 %% @returns `ok`

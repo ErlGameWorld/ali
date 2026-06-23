@@ -18,9 +18,6 @@
     findProjectRootFromModule/0
 ]).
 
--define(DEFAULT_MAX_FILE_BYTES, 65536).
--define(DEFAULT_MAX_RESULTS, 50).
-
 %% @doc 读取项目内相对路径文件，超大文件按 maxBytes 截断。
 -spec readFile(map(), map()) -> {ok, map()} | {error, term()}.
 readFile(Args, Config) ->
@@ -32,7 +29,7 @@ readFile(Args, Config) ->
         _ ->
             case resolvePath(Root, Path) of
                 {ok, AbsPath} ->
-                    MaxBytes = maps:get(maxBytes, Args, ?DEFAULT_MAX_FILE_BYTES),
+                    MaxBytes = maps:get(maxBytes, Args, alConfig:get(toolReadFileMaxBytes)),
                     readFileLimited(AbsPath, MaxBytes);
                 {error, Reason} ->
                     {error, Reason}
@@ -51,7 +48,7 @@ readFileLimited(AbsPath, MaxBytes) ->
                         path => AbsPath,
                         truncated => true,
                         size => Size,
-                        content => Partial
+                        content => llmJson:sanitize_binary(Partial)
                     }};
                 {error, Reason} ->
                     {error, Reason}
@@ -59,7 +56,11 @@ readFileLimited(AbsPath, MaxBytes) ->
         {ok, #file_info{type = regular}} ->
             case file:read_file(AbsPath) of
                 {ok, Content} ->
-                    {ok, #{path => AbsPath, truncated => false, content => Content}};
+                    {ok, #{
+                        path => AbsPath,
+                        truncated => false,
+                        content => llmJson:sanitize_binary(Content)
+                    }};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -91,25 +92,97 @@ listFiles(Args, Config) ->
     end.
 
 %% 递归或非递归收集匹配 pattern 的文件路径。
+%% 递归时跳过构建产物、版本控制、Agent 数据等噪音目录（见 excludedDirs/0），
+%% 避免遍历 _build 等海量目录拖慢大型项目。
 collectFiles(Dir, Pattern, true, Acc) ->
     PatternStr = toList(Pattern),
-    Glob = filename:join(Dir, PatternStr),
-    Direct = filelib:wildcard(Glob),
-    SubDirs = [filename:join(Dir, D) || D <- filelib:wildcard(filename:join(Dir, "*")),
-                                       filelib:is_dir(filename:join(Dir, D))],
+    Direct = filelib:wildcard(filename:join(Dir, PatternStr)),
     Acc1 = lists:usort(Acc ++ Direct),
-    lists:foldl(fun(Sub, A) -> collectFiles(Sub, Pattern, true, A) end, Acc1, SubDirs);
+    lists:foldl(fun(Sub, A) -> collectFiles(Sub, Pattern, true, A) end, Acc1, subDirectories(Dir));
 collectFiles(Dir, Pattern, false, Acc) ->
     PatternStr = toList(Pattern),
-    Glob = filename:join(Dir, PatternStr),
-    lists:usort(Acc ++ filelib:wildcard(Glob)).
+    lists:usort(Acc ++ filelib:wildcard(filename:join(Dir, PatternStr))).
+
+%% 列出 Dir 下未被排除的子目录绝对路径。
+subDirectories(Dir) ->
+    case file:list_dir(Dir) of
+        {ok, Entries} ->
+            [filename:join(Dir, E) || E <- Entries,
+                                      not isExcludedDir(E),
+                                      filelib:is_dir(filename:join(Dir, E))];
+        {error, _} ->
+            []
+    end.
+
+%% @doc 递归遍历时默认跳过的目录名（叠加配置项 `indexExclude` 与 `.gitignore`）。
+excludedDirs() ->
+    Base = ["_build", ".git", ".rebar3", ".hg", ".svn", ".eunit",
+            "node_modules", ".al", "_checkouts", ".elixir_ls", "deps"],
+    Extra = case aliCfg:getV(indexExclude) of
+        {ok, L} when is_list(L) -> [toList(X) || X <- L];
+        _ -> []
+    end,
+    Base ++ Extra ++ gitignorePatterns().
+
+%% 解析项目根目录 `.gitignore` 中不含通配符的目录名（如 `ebin/`、`logs/`），
+%% 合并进 excludedDirs 避免遍历垃圾目录；同时返回模式列表供文件级过滤。
+%% 结果按文件 mtime 缓存到 persistent_term，避免每次目录遍历都重复读文件。
+gitignorePatterns() ->
+    Root = findProjectRootFromModule(),
+    Path = filename:join(Root, ".gitignore"),
+    CacheKey = {?MODULE, gitignorePatterns},
+    CurrentMtime = case file:read_file_info(Path) of
+        {ok, #file_info{mtime = M}} -> M;
+        {error, _} -> undefined
+    end,
+    case persistent_term:get(CacheKey, undefined) of
+        {CurrentMtime, Patterns} -> Patterns;
+        _ -> loadGitignorePatterns(Path, CurrentMtime, CacheKey)
+    end.
+
+loadGitignorePatterns(Path, Mtime, CacheKey) ->
+    Patterns = case file:read_file(Path) of
+        {ok, Content} ->
+            Lines = binary:split(Content, <<"\n"/utf8>>, [global]),
+            lists:filtermap(fun parseGitignoreLine/1, Lines);
+        {error, _} ->
+            []
+    end,
+    persistent_term:put(CacheKey, {Mtime, Patterns}),
+    Patterns.
+
+%% 解析单行 .gitignore：跳过注释/空行，提取以 `/` 结尾的目录模式名（去掉尾 `/`）。
+parseGitignoreLine(Line) ->
+    Stripped = string:trim(binary_to_list(Line)),
+    case Stripped of
+        "" -> false;
+        "#" ++ _ -> false;
+        Name ->
+            case lists:last(Name) =:= $/ of
+                true ->
+                    %% 目录模式如 "ebin/" → 排除同名目录
+                    DirName = string:trim(Name, trailing, "/"),
+                    case string:chr(DirName, $*) =:= 0 andalso
+                         string:chr(DirName, $?) =:= 0 andalso
+                         string:chr(DirName, $[) =:= 0 of
+                        true -> {true, DirName};
+                        false -> false
+                    end;
+                false ->
+                    false
+            end
+    end.
+
+%% 判断目录名是否应被排除。
+isExcludedDir(Name) ->
+    lists:member(toList(Name), excludedDirs()).
 
 %% @doc 在项目文本文件中搜索 query 子串，返回匹配行列表。
 -spec searchText(map(), map()) -> {ok, map()} | {error, term()}.
 searchText(Args, Config) ->
     Query = maps:get(query, Args, undefined),
     Root = projectRoot(Config),
-    MaxResults = maps:get(maxResults, Args, ?DEFAULT_MAX_RESULTS),
+    MaxResults = maps:get(maxResults, Args, alConfig:get(toolListFilesMaxResults)),
     SubPath = maps:get(path, Args, <<"."/utf8>>),
     case Query of
         undefined ->
@@ -124,21 +197,23 @@ searchText(Args, Config) ->
 
 %% 在文件列表中逐文件搜索直至达到 maxResults。
 searchFiles(_Root, [], _Query, _Max, Acc) ->
-    Acc;
+    lists:reverse(Acc);
 searchFiles(_Root, _Files, _Query, Max, Acc) when length(Acc) >= Max ->
-    Acc;
+    lists:reverse(Acc);
 searchFiles(Root, [Rel | Rest], Query, Max, Acc) ->
     Abs = filename:join([Root | filename:split(toList(Rel))]),
     case file:read_file(Abs) of
         {ok, Content} ->
             Lines = binary:split(Content, <<"\n"/utf8>>, [global]),
             FileMatches = collectLineMatches(Rel, Lines, Query, 1, []),
-            searchFiles(Root, Rest, Query, Max, Acc ++ FileMatches);
+            %% FileMatches 与 Acc 均按“最新匹配前置”累积，避免 Acc ++ FileMatches 的 O(n²) 复制。
+            searchFiles(Root, Rest, Query, Max, FileMatches ++ Acc);
         {error, _} ->
             searchFiles(Root, Rest, Query, Max, Acc)
     end.
 
 %% 收集单文件中包含 query 的行号与截断后的行文本。
+%% 采用前插累加器，最终由 searchFiles 统一 reverse，保持原始顺序。
 collectLineMatches(_Rel, [], _Query, _N, Acc) ->
     Acc;
 collectLineMatches(Rel, [Line | Rest], Query, N, Acc) ->
@@ -147,7 +222,7 @@ collectLineMatches(Rel, [Line | Rest], Query, N, Acc) ->
             collectLineMatches(Rel, Rest, Query, N + 1, Acc);
         _ ->
             collectLineMatches(Rel, Rest, Query, N + 1,
-                               Acc ++ [#{file => Rel, line => N, text => trimLine(Line)}])
+                               [#{file => Rel, line => N, text => trimLine(Line)} | Acc])
     end.
 
 %% 将过长行截断至 200 字节。
@@ -162,7 +237,7 @@ trimLine(Line) ->
 projectIndex(_Args, Config) ->
     case alCodeIndexer:refresh(Config) of
         {ok, Stats} ->
-            Modules = [summarize_index(M) || M <- alCodeIndexer:all_modules()],
+            Modules = [summarizeIndex(M) || M <- alCodeIndexer:allModules()],
             {ok, maps:merge(Stats, #{
                 root => maps:get(projectRoot, Config, <<"."/utf8>>),
                 modules => lists:sublist(Modules, 50)
@@ -172,8 +247,8 @@ projectIndex(_Args, Config) ->
     end.
 
 %% 将索引条目压缩为模块摘要 map。
-summarize_index(Mod) ->
-    case alCodeIndexer:lookup_module(Mod) of
+summarizeIndex(Mod) ->
+    case alCodeIndexer:lookupModule(Mod) of
         {ok, E} ->
             #{
                 module => Mod,
@@ -250,26 +325,36 @@ resolvePath(Root, Path) ->
     end.
 
 %% 判断 Abs 是否在 Root 目录树下。
+%% 统一分隔符为 "/" 后比较：Erlang 的 filename 函数在 Windows 上也用 "/"，
+%% 直接用 OS 原生 "\\" 比较会导致嵌套路径误判为越界。
 isSubpath(Root, Path) ->
-    Sep = pathSeparator(),
-    RootPrefix = Root ++ Sep,
-    Path =:= Root orelse string:prefix(Path, RootPrefix) =/= nomatch.
+    R = unifySep(Root),
+    P = unifySep(Path),
+    P =:= R orelse string:prefix(P, R ++ "/") =/= nomatch.
+
+%% 将路径中的反斜杠统一为正斜杠，便于跨平台前缀比较。
+unifySep(Path) ->
+    [case C of $\\ -> $/; _ -> C end || C <- Path].
 
 %% 检测 .git、_build、.env 等禁止 Agent 访问的路径片段。
+%% 注意：路径已通过 unifySep 统一为 "/" 分隔符，无需匹配 "\\" 模式。
 isBlockedPath(Path) ->
-    Lower = string:lowercase(Path),
+    Lower = string:lowercase(unifySep(Path)),
     Blocked = [
-        "/.git/", "\\.git\\",
-        "/_build/", "\\_build\\",
-        "/.rebar3/", "\\.rebar3\\",
-        "/.env", "\\.env",
-        "/.env.", "\\.env.",
-        "/.erlang.cookie", "\\.erlang.cookie",
-        "/.ssh/", "\\.ssh\\",
-        "/.aws/", "\\.aws\\",
-        "/rebar3.crashdump", "\\rebar3.crashdump"
+        "/.git/",
+        "/_build/",
+        "/.rebar3/",
+        "/.env",
+        "/.env.",
+        "/.erlang.cookie",
+        "/.ssh/",
+        "/.aws/",
+        "/config/aliCfg.cfg",
+        "/config/config.local.cfg",
+        "/.al/",
+        "/rebar3.crashdump"
     ],
-    lists:any(fun(B) -> string:str(Lower, B) > 0 end, Blocked).
+    lists:any(fun(B) -> string:str(Lower, string:lowercase(B)) > 0 end, Blocked).
 
 %% 按扩展名判断是否为可搜索的文本文件。
 isTextFile(F) ->
@@ -278,17 +363,14 @@ isTextFile(F) ->
 
 %% 计算相对于项目根的路径（binary）。
 relativePath(Root, Abs) ->
-    RootNorm = normalizePath(Root),
-    AbsNorm = normalizePath(Abs),
-    Sep = pathSeparator(),
-    case string:prefix(AbsNorm, RootNorm ++ Sep) of
+    RootNorm = unifySep(normalizePath(Root)),
+    AbsNorm = unifySep(normalizePath(Abs)),
+    case string:prefix(AbsNorm, RootNorm ++ "/") of
         nomatch ->
             toBinary(filename:basename(AbsNorm));
         Rest ->
             toBinary(Rest)
     end.
-
--define(MAX_SYMLINK_DEPTH, 20).
 
 %% 规范化路径：absname 并解析符号链接。
 normalizePath(Path) when is_binary(Path) ->
@@ -297,16 +379,20 @@ normalizePath(Path) ->
     canonicalPath(filename:absname(Path), 0).
 
 %% 解析符号链接获取规范路径，防止路径穿越攻击和无限递归
-canonicalPath(Path, Depth) when Depth >= ?MAX_SYMLINK_DEPTH ->
+canonicalPath(Path, Depth) ->
+    MaxDepth = alConfig:get(symlinkMaxDepth),
+    canonicalPath(Path, Depth, MaxDepth).
+
+canonicalPath(Path, Depth, MaxDepth) when Depth >= MaxDepth ->
     error_logger:warning_msg("~p: symlink too deep: ~s~n", [?MODULE, Path]),
     Path;
-canonicalPath(Path, Depth) ->
+canonicalPath(Path, Depth, MaxDepth) ->
     case file:read_link_info(Path) of
         {ok, #file_info{type = symlink}} ->
             case file:read_link(Path) of
                 {ok, Target} ->
                     TargetNorm = filename:absname(Target, filename:dirname(Path)),
-                    canonicalPath(TargetNorm, Depth + 1);
+                    canonicalPath(TargetNorm, Depth + 1, MaxDepth);
                 _ ->
                     Path
             end;
@@ -322,10 +408,3 @@ toBinary(X) when is_binary(X) -> X;
 toBinary(X) when is_list(X) -> unicode:characters_to_binary(X);
 toBinary(X) when is_atom(X) -> atom_to_binary(X, utf8);
 toBinary(X) -> unicode:characters_to_binary(io_lib:format("~p", [X])).
-
-%% 返回当前 OS 的路径分隔符。
-pathSeparator() ->
-    case os:type() of
-        {win32, _} -> "\\";
-        _ -> "/"
-    end.

@@ -18,7 +18,7 @@ logs
 *.iml
 rebar3.crashdump
 *~
-config/config.cfg
+config/aliCfg.cfg
 config.json
 rebar.lock
 .al/

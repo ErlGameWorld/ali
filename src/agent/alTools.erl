@@ -14,8 +14,18 @@
     openAiTools/0,
     execute/4,
     execute/5,
-    toolModule/1
+    toolModule/1,
+    registerTool/1,
+    unregisterTool/1,
+    registeredTools/0,
+    customToolLevel/1,
+    emitProgress/2
 ]).
+
+-define(CUSTOM_TOOLS_KEY, {?MODULE, customTools}).
+-define(BUILTIN_LIST_KEY, {?MODULE, builtinList}).
+-define(BUILTIN_INDEX_KEY, {?MODULE, builtinIndex}).
+-define(DEFAULT_TOOL_TIMEOUT, 60000).
 
 -type toolDef() :: #{
     name := atom(),
@@ -111,24 +121,99 @@ execute(Tool, Args, Config, SessionId, Context) ->
             {error, denied}
     end.
 
-%% 策略通过后实际调用 alTool* 模块执行
+%% 策略通过后实际调用 alTool* 模块执行。
+%% 使用 spawn + monitor 实现超时保护，防止慢工具（如读超大文件、慢 git）
+%% 阻塞 Agent 循环。默认超时 60s，可通过 Config 的 toolTimeout 覆盖。
 doExecute(Tool, Args, Config, SessionId, _Context) ->
     case findTool(Tool) of
         {ok, #{module := Mod, function := Fun}} ->
             Started = erlang:monotonic_time(millisecond),
-            Result = try Mod:Fun(Args, Config) catch
-                Class:ToolReason:Stack ->
-                    {error, #{class => Class, reason => ToolReason, stack => lists:sublist(Stack, 5)}}
-            end,
+            ToolConfig = Config#{sessionId => SessionId, toolName => Tool},
+            Timeout = maps:get(toolTimeout, Config, ?DEFAULT_TOOL_TIMEOUT),
+            Result = callWithTimeout(Mod, Fun, Args, ToolConfig, Timeout, Config),
             Elapsed = erlang:monotonic_time(millisecond) - Started,
             Out = formatToolResult(Result, Elapsed),
             alAudit:log(SessionId, Tool, Args, Out),
+            %% 工具级指标采集
+            alMetrics:recordTool(#{
+                tool => Tool,
+                durationMs => Elapsed,
+                ok => maps:get(ok, Out, true)
+            }),
+            alMetrics:emitTelemetry([ali, tool, exec],
+                #{durationMs => Elapsed},
+                #{tool => Tool, ok => maps:get(ok, Out, true), sessionId => SessionId}),
             case Result of
                 {ok, Data} -> {ok, Data#{elapsedMs => Elapsed}};
                 {error, Reason} -> {error, Reason}
             end;
         error ->
             {error, unknownTool}
+    end.
+
+%% 在独立进程中执行工具调用，超时返回 {error, toolTimeout}。
+%% 工具进程可通过 alTools:emitProgress(ToolConfig, Event) 发送流式进度事件，
+%% 调用方会转发到 alProgress，实现工具执行的流式反馈。
+callWithTimeout(Mod, Fun, Args, ToolConfig, Timeout, Config) ->
+    Caller = self(),
+    Ref = make_ref(),
+    %% 注入 callerPid 与 toolRef，供工具调用 emitProgress
+    ToolConfigWithCaller = ToolConfig#{callerPid => Caller, toolRef => Ref},
+    {Pid, MonRef} = spawn_monitor(fun() ->
+        Result = try Mod:Fun(Args, ToolConfigWithCaller) catch
+            Class:Reason:Stack ->
+                {error, #{class => Class, reason => Reason, stack => lists:sublist(Stack, 5)}}
+        end,
+        Caller ! {toolResult, Ref, Result}
+    end),
+    collectToolMessages(Pid, MonRef, Ref, Config, Timeout).
+
+%% 收集工具进程的进度消息与最终结果，超时则杀进程。
+collectToolMessages(Pid, MonRef, Ref, Config, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    collectToolMessagesLoop(Pid, MonRef, Ref, Config, Deadline).
+
+collectToolMessagesLoop(Pid, MonRef, Ref, Config, Deadline) ->
+    Now = erlang:monotonic_time(millisecond),
+    Remaining = max(0, Deadline - Now),
+    receive
+        {toolProgress, Ref, Event} ->
+            emitToolProgress(Config, Event),
+            collectToolMessagesLoop(Pid, MonRef, Ref, Config, Deadline);
+        {toolResult, Ref, Result} ->
+            erlang:demonitor(MonRef, [flush]),
+            Result;
+        {'DOWN', MonRef, process, Pid, Reason} ->
+            {error, #{class => processCrash, reason => Reason}}
+    after Remaining ->
+        erlang:demonitor(MonRef, [flush]),
+        exit(Pid, kill),
+        {error, toolTimeout}
+    end.
+
+%% 将工具进程的进度事件转发到 alProgress（若配置了 progressId）。
+emitToolProgress(Config, Event) ->
+    case maps:get(progressId, Config, undefined) of
+        undefined -> ok;
+        _ProgressId ->
+            %% 复用 alLoop 的 emit_progress 机制：通过进程字典或直接调用
+            %% 这里直接调用 alProgress:emit，保持与 alLoop 一致的事件流
+            alProgress:emit(maps:get(progressId, Config), Event)
+    end.
+
+%% @doc 工具实现可调用此函数向调用方发送流式进度事件。
+%% 工具在独立进程中执行，通过 ToolConfig 中的 callerPid 与 toolRef
+%% 发送 {toolProgress, Ref, Event} 消息，由调度器转发到 alProgress。
+%% 若 ToolConfig 中缺少 callerPid/toolRef（如直接调用），则忽略。
+-spec emitProgress(map(), map()) -> ok.
+emitProgress(ToolConfig, Event) ->
+    case {maps:get(callerPid, ToolConfig, undefined),
+          maps:get(toolRef, ToolConfig, undefined)} of
+        {Pid, Ref} when is_pid(Pid), is_reference(Ref) ->
+            Pid ! {toolProgress, Ref, Event},
+            ok;
+        _ ->
+            ok
     end.
 
 %% 写操作类工具：生成预览供用户确认
@@ -187,11 +272,15 @@ logAndError(SessionId, Tool, Args, Out) ->
     alAudit:log(SessionId, Tool, Args, Out),
     ok.
 
-%% 按名称查找工具定义
+%% 按名称查找工具定义：先查内置索引（O(1) map），再查自定义注册表（O(1)）。
 findTool(Name) ->
-    case lists:filter(fun(T) -> maps:get(name, T) =:= Name end, allTools()) of
-        [T | _] -> {ok, T};
-        [] -> error
+    case maps:find(Name, builtinIndex()) of
+        {ok, T} -> {ok, T};
+        error ->
+            case maps:get(Name, customRegistry(), undefined) of
+                undefined -> error;
+                Def -> {ok, maps:without([level], Def)}
+            end
     end.
 
 %% @doc 返回工具对应的实现模块名。
@@ -208,8 +297,90 @@ formatTool(#{name := Name, description := Desc, parameters := Params}) ->
 createTaskId() ->
     integer_to_binary(erlang:unique_integer([positive, monotonic])).
 
+%% @doc 运行时注册自定义工具，无需修改源码即可扩展 Agent 能力。
+%%
+%% Def 需含 `name`(atom)、`description`(binary)、`parameters`(JSON binary)、
+%% `module`、`function`；可选 `level`（read/executeSafe/executeRisky/write，默认 executeRisky）。
+%% 同名工具将被覆盖。内置工具不可被覆盖（返回 `{error, builtinConflict}`）。
+-spec registerTool(map()) -> ok | {error, term()}.
+registerTool(Def) when is_map(Def) ->
+    Required = [name, description, parameters, module, function],
+    case lists:all(fun(K) -> maps:is_key(K, Def) end, Required) of
+        false ->
+            {error, {missingKeys, [K || K <- Required, not maps:is_key(K, Def)]}};
+        true ->
+            Name = maps:get(name, Def),
+            case isBuiltin(Name) of
+                true -> {error, builtinConflict};
+                false ->
+                    Level = maps:get(level, Def, executeRisky),
+                    Custom = customRegistry(),
+                    persistent_term:put(?CUSTOM_TOOLS_KEY,
+                        Custom#{Name => Def#{level => Level}}),
+                    ok
+            end
+    end;
+registerTool(_) ->
+    {error, invalidToolDef}.
+
+%% @doc 注销自定义工具。
+-spec unregisterTool(atom()) -> ok.
+unregisterTool(Name) ->
+    Custom = customRegistry(),
+    persistent_term:put(?CUSTOM_TOOLS_KEY, maps:remove(Name, Custom)),
+    ok.
+
+%% @doc 返回所有已注册的自定义工具定义列表。
+-spec registeredTools() -> [map()].
+registeredTools() ->
+    maps:values(customRegistry()).
+
+%% @doc 查询自定义工具的权限级别；未注册返回默认 executeRisky。
+-spec customToolLevel(atom()) -> atom().
+customToolLevel(Name) ->
+    case maps:get(Name, customRegistry(), undefined) of
+        #{level := Level} -> Level;
+        _ -> executeRisky
+    end.
+
+%% 读取自定义工具注册表（persistent_term 持久化于节点内）。
+customRegistry() ->
+    persistent_term:get(?CUSTOM_TOOLS_KEY, #{}).
+
+%% 判断是否为内置工具名（O(1)，走缓存索引）。
+isBuiltin(Name) ->
+    maps:is_key(Name, builtinIndex()).
+
+%% @doc 全部工具 = 内置工具 + 运行时注册的自定义工具。
 -spec allTools() -> [toolDef()].
 allTools() ->
+    Customs = [maps:without([level], D) || D <- registeredTools()],
+    cachedBuiltins() ++ Customs.
+
+%% 内置工具列表缓存：builtinTools/0 是静态字面量，只构建一次存入 persistent_term。
+cachedBuiltins() ->
+    case persistent_term:get(?BUILTIN_LIST_KEY, undefined) of
+        undefined ->
+            L = builtinTools(),
+            persistent_term:put(?BUILTIN_LIST_KEY, L),
+            L;
+        L ->
+            L
+    end.
+
+%% 内置工具名称→定义索引（O(1) 查找），同样只构建一次。
+builtinIndex() ->
+    case persistent_term:get(?BUILTIN_INDEX_KEY, undefined) of
+        undefined ->
+            Index = maps:from_list([{maps:get(name, T), T} || T <- cachedBuiltins()]),
+            persistent_term:put(?BUILTIN_INDEX_KEY, Index),
+            Index;
+        Index ->
+            Index
+    end.
+
+-spec builtinTools() -> [toolDef()].
+builtinTools() ->
     [
         #{
             name => readFile,
@@ -408,9 +579,121 @@ allTools() ->
             function => remoteNodeInfo
         },
         #{
+            name => topProcesses,
+            description => <<"Top processes by metric: memory | reductions | message_queue_len (find hotspots)"/utf8>>,
+            parameters => <<"{\"by\": \"memory\", \"limit\": 10}"/utf8>>,
+            module => alToolRuntime,
+            function => topProcesses
+        },
+        #{
+            name => schedulerInfo,
+            description => <<"Scheduler, run queue, reductions and memory overview"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alToolRuntime,
+            function => schedulerInfo
+        },
+        #{
+            name => etsTables,
+            description => <<"List ETS tables with size/memory/type (sorted by memory desc)"/utf8>>,
+            parameters => <<"{\"limit\": 100}"/utf8>>,
+            module => alToolRuntime,
+            function => etsTables
+        },
+        #{
+            name => gitStatus,
+            description => <<"Show git working tree status (read-only)"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alToolGit,
+            function => gitStatus
+        },
+        #{
+            name => gitDiff,
+            description => <<"Show git diff stat; optional path/staged (read-only)"/utf8>>,
+            parameters => <<"{\"path\": \"src/x.erl\", \"staged\": false}"/utf8>>,
+            module => alToolGit,
+            function => gitDiff
+        },
+        #{
+            name => gitLog,
+            description => <<"Show recent git commits (read-only)"/utf8>>,
+            parameters => <<"{\"limit\": 20}"/utf8>>,
+            module => alToolGit,
+            function => gitLog
+        },
+        #{
+            name => gitBranch,
+            description => <<"List git branches with tracking info (read-only)"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alToolGit,
+            function => gitBranch
+        },
+        #{
+            name => svnStatus,
+            description => <<"Show SVN working copy status (read-only)"/utf8>>,
+            parameters => <<"{\"showUpdates\": false}"/utf8>>,
+            module => alToolSvn,
+            function => svnStatus
+        },
+        #{
+            name => svnDiff,
+            description => <<"Show SVN diff; optional path/revision (read-only)"/utf8>>,
+            parameters => <<"{\"path\": \"src/x.erl\", \"revision\": \"BASE:HEAD\"}"/utf8>>,
+            module => alToolSvn,
+            function => svnDiff
+        },
+        #{
+            name => svnLog,
+            description => <<"Show recent SVN commits (read-only)"/utf8>>,
+            parameters => <<"{\"limit\": 20}"/utf8>>,
+            module => alToolSvn,
+            function => svnLog
+        },
+        #{
+            name => svnInfo,
+            description => <<"Show SVN working copy info: URL, revision, root (read-only)"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alToolSvn,
+            function => svnInfo
+        },
+        #{
+            name => searchCode,
+            description => <<"Semantic/keyword search over the codebase; returns most relevant function snippets"/utf8>>,
+            parameters => <<"{\"query\": \"how are tools dispatched\", \"limit\": 5}"/utf8>>,
+            module => alToolAnalyze,
+            function => searchCode
+        },
+        #{
+            name => semanticSearch,
+            description => <<"Vector semantic search (hybrid: embeddings + TF-IDF); best for natural-language queries. Falls back to TF-IDF when embeddings unavailable"/utf8>>,
+            parameters => <<"{\"query\": \"where authentication is handled\", \"limit\": 5, \"vectorWeight\": 0.6, \"tfidfWeight\": 0.4}"/utf8>>,
+            module => alToolAnalyze,
+            function => semanticSearch
+        },
+        #{
+            name => planSet,
+            description => <<"Create/replace the task plan for a multi-step request (array of step titles)"/utf8>>,
+            parameters => <<"{\"steps\": [\"Investigate X\", \"Implement Y\", \"Verify with tests\"]}"/utf8>>,
+            module => alPlan,
+            function => planSet
+        },
+        #{
+            name => planUpdate,
+            description => <<"Update a plan step status (pending|in_progress|done|skipped) and optional note"/utf8>>,
+            parameters => <<"{\"id\": 1, \"status\": \"done\", \"note\": \"...\"}"/utf8>>,
+            module => alPlan,
+            function => planUpdate
+        },
+        #{
+            name => planGet,
+            description => <<"Get the current task plan and progress"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alPlan,
+            function => planGet
+        },
+        #{
             name => callFunction,
-            description => <<"Call an Erlang function (blocked if on execBlacklist)"/utf8>>,
-            parameters => <<"{\"module\": \"llmCli\", \"function\": \"estimateTokens\", \"args\": [\"hello\"]}"/utf8>>,
+            description => <<"Call an Erlang function (blocked if on execBlacklist). String args auto-coerce to atom/pid/number when appropriate (e.g. ets:info/1)."/utf8>>,
+            parameters => <<"{\"module\": \"ets\", \"function\": \"info\", \"args\": [\"alMetrics\"]}"/utf8>>,
             module => alToolEval,
             function => callFunction
         },
@@ -423,8 +706,8 @@ allTools() ->
         },
         #{
             name => patchFile,
-            description => <<"Replace text in a project file (requires confirmation)"/utf8>>,
-            parameters => <<"{\"path\": \"src/example.erl\", \"oldText\": \"...\", \"newText\": \"...\"}"/utf8>>,
+            description => <<"Replace text in a project file; oldText must match uniquely unless replaceAll=true (requires confirmation)"/utf8>>,
+            parameters => <<"{\"path\": \"src/example.erl\", \"oldText\": \"...\", \"newText\": \"...\", \"replaceAll\": false}"/utf8>>,
             module => alToolEdit,
             function => patchFile
         },
@@ -448,6 +731,13 @@ allTools() ->
             parameters => <<"{\"path\": \"src/example.erl\"}"/utf8>>,
             module => alToolEdit,
             function => listBackups
+        },
+        #{
+            name => sessionUndo,
+            description => <<"Undo all file changes made in the current session (restores to pre-session state)"/utf8>>,
+            parameters => <<"{}"/utf8>>,
+            module => alToolEdit,
+            function => sessionUndo
         },
         #{
             name => formatCode,

@@ -77,19 +77,37 @@ level(nodeInfo) -> read;
 level(agentConfig) -> read;
 level(runtimeSummary) -> read;
 level(remoteNodeInfo) -> read;
-level(callFunction) -> executeSafe;
+level(topProcesses) -> read;
+level(schedulerInfo) -> read;
+level(etsTables) -> read;
+level(gitStatus) -> read;
+level(gitDiff) -> read;
+level(gitLog) -> read;
+level(gitBranch) -> read;
+level(svnStatus) -> read;
+level(svnDiff) -> read;
+level(svnLog) -> read;
+level(svnInfo) -> read;
+level(searchCode) -> read;
+level(semanticSearch) -> read;
+level(planSet) -> read;
+level(planUpdate) -> read;
+level(planGet) -> read;
+level(callFunction) -> executeRisky;
 level(runEunit) -> executeSafe;
 level(runCommonTest) -> executeSafe;
 level(generateEunit) -> write;
 level(generateCommonTest) -> write;
 level(listTestModules) -> read;
-level(compileLoad) -> executeRisky;
+level(compileLoad) -> write;
 level(rollbackFile) -> write;
+level(sessionUndo) -> write;
 level(listBackups) -> read;
 level(writeFile) -> write;
 level(patchFile) -> write;
 level(formatCode) -> write;
-level(_) -> executeRisky.
+%% 未列出的工具：先查自定义工具注册表，缺省按高风险处理。
+level(Tool) -> alTools:customToolLevel(Tool).
 
 %% @doc 判断指定工具在当前策略下是否需要用户确认。
 %% 写操作看 requireWriteConfirmation，高风险看 requireRiskyConfirmation；
@@ -162,36 +180,44 @@ mode_allows(edit, executeRisky) -> false;
 mode_allows(exec, _) -> true;
 mode_allows(_, _) -> true.
 
-%% @doc 递归脱敏 term，将含敏感关键字的字符串替换为 `***REDACTED***`。
+%% @doc 递归脱敏 term：仅根据<b>键名</b>判断是否脱敏值，
+%% 不扫描 value 内容，避免误杀含 "token" 等普通关键词的合法数据。
 %% 用于审计日志，避免 api_key、password、token 等泄露。
 %% @param Term 任意 Erlang term（map、list、binary 等）
 %% @returns 脱敏后的 term，结构与输入相同
 -spec sanitizeTerm(term()) -> term().
 sanitizeTerm(Term) when is_map(Term) ->
     maps:fold(fun(K, V, Acc) ->
-        maps:put(K, sanitizeTerm(V), Acc)
+        case isSensitiveKeyName(K) of
+            true ->
+                %% 键名匹配到敏感词 → 值整体脱敏（不递归进入）
+                maps:put(K, <<"***REDACTED***"/utf8>>, Acc);
+            false ->
+                %% 键名安全 → 递归处理嵌套结构
+                maps:put(K, sanitizeTerm(V), Acc)
+        end
     end, #{}, Term);
 sanitizeTerm(Term) when is_list(Term) ->
     case io_lib:printable_unicode_list(Term) of
         true ->
-            sanitizeString(unicode:characters_to_binary(Term));
+            %% 纯文本列表（如 JSON 字符串值）：键名已在 map fold 环节判断，
+            %% 此处从键名安全进入，不扫描内容
+            unicode:characters_to_binary(Term);
         false ->
             [sanitizeTerm(X) || X <- Term]
     end;
-sanitizeTerm(Term) when is_binary(Term) ->
-    sanitizeString(Term);
 sanitizeTerm(Term) ->
     Term.
 
-%% 对单个二进制字符串检测敏感关键字并脱敏
-sanitizeString(Bin) ->
-    Lower = string:lowercase(binary_to_list(Bin)),
-    case isSensitiveKey(Lower) of
-        true -> <<"***REDACTED***"/utf8>>;
-        false -> Bin
-    end.
-
-%% 判断字符串是否包含 api_key、password、secret、token 等敏感子串
-isSensitiveKey(S) ->
-    lists:any(fun(Prefix) -> string:str(S, Prefix) > 0 end,
-              ["api_key", "apikey", "password", "secret", "token", "authorization"]).
+%% 判断 map 的键名（atom 或 binary）是否为敏感字段名。
+%% 匹配 api_key、password、secret、token、authorization 及其变体。
+isSensitiveKeyName(K) when is_atom(K) ->
+    Lower = string:lowercase(atom_to_list(K)),
+    lists:any(fun(Prefix) -> string:str(Lower, Prefix) > 0 end,
+              ["api_key", "apikey", "password", "secret", "token", "authorization"]);
+isSensitiveKeyName(K) when is_binary(K) ->
+    Lower = string:lowercase(binary_to_list(K)),
+    lists:any(fun(Prefix) -> string:str(Lower, Prefix) > 0 end,
+              ["api_key", "apikey", "password", "secret", "token", "authorization"]);
+isSensitiveKeyName(_) ->
+    false.

@@ -46,10 +46,10 @@ init() ->
 %% 消息通知调用方；同时启动 alProgress 进度跟踪。
 %% @param Prompt 用户提示词（binary）
 %% @param Opts 选项 map，可含 sessionId 等
-%% @param Runner 回调 `fun((binary(), map()) -> {term(), map()})`，
-%%        返回 `{{ok, Answer}, NewState}` 或 `{{error, Reason}, NewState}`
+%% @param Runner 回调 `fun((binary(), map()) -> {{ok, binary()} | {error, term()}, map()})`，
+%%        接收 Prompt 与 Opts，返回 `{{ok, Answer}, NewState}` 或 `{{error, Reason}, NewState}`
 %% @returns `{ok, binary()}` 新任务的 TaskId
--spec spawnAsk(binary(), map(), fun((map()) -> {term(), map()})) -> {ok, binary()}.
+-spec spawnAsk(binary(), map(), fun((binary(), map()) -> {{ok, binary()} | {error, term()}, map()})) -> {ok, binary()}.
 spawnAsk(Prompt, Opts, Runner) ->
     init(),
     TaskId = integer_to_binary(erlang:unique_integer([positive, monotonic])),
