@@ -1,0 +1,16 @@
+{
+  "liveDataKeywords": [
+    "用户",
+    "订单",
+    "账户"
+  ],
+  "liveDataOpKeywords": [
+    "改订单",
+    "写入账户",
+    "更新状态"
+  ],
+  "aliases": {
+    "主城": ["castle"],
+    "城堡": ["castle"]
+  ]
+}

@@ -1,24 +1,104 @@
-.rebar3
-_build
-_checkouts
-_vendor
-.eunit
-*.o
+# =============================================================================
+# ali 项目 — 仅提交源码与配置，其余一律忽略
+# =============================================================================
+
+# --- Erlang / rebar3 ---
+.rebar3/
+_build/
+_checkouts/
+_vendor/
+.eunit/
+ebin/
+.rebar/
+rebar3.crashdump
+erl_crash.dump
 *.beam
+*.o
 *.plt
+*.coverdata
+cover/
+doc/
+dialyzer_warnings
+
+# rebar3 解析依赖后生成，不提交（本地 rebar3 compile 会重新生成）
+rebar.lock
+**/rebar.lock
+aili
+ali
+.ali
+
+server
+
+# --- Rust / Cargo ---
+# 显式路径（Windows 下比 ** 更稳；且 aliCore 若曾有独立 .git，只靠根规则不够）
+/c_src/aliCore/target/
+/c_src/aliCore/target_run/
+c_src/**/target/
+c_src/**/target_run/
+**/target/
+**/target_run/
+**/*.rs.bk
+*.pdb
+*.dll
+*.so
+*.dylib
+# 若把 release 二进制拷到项目根目录，也不提交
+# 旧名兼容（可删）
+
+# --- 本地运行时数据（默认在启动目录的 .ali/ 下；也可配置为 xxx/.ali；见上方 .ali）---
+# 兼容旧布局：可变数据曾写在 priv/ 下
+priv/qdrant/storage/
+priv/index/
+c_src/**/priv/index/
+priv/db/*.db
+priv/db/*.db-*
+priv/db/*.db-journal
+priv/db/*.db-wal
+priv/db/*.db-shm
+priv/db/store/
+
+# --- 跨平台预编译二进制：按需下载，不入库（见 priv/scripts/build_core.* / 下载脚本）---
+priv/aliCore
+priv/aliCore.exe
+
+# --- Patch / 仿真临时文件 ---
+*.ali.bak.*
+**/.ali_patch_*
+
+# --- Release 打包输出 ---
+_rel/
+rel/
+
+# --- 环境变量 / 密钥（保留 *.example）---
+.env
+.env.*
+!.env.example
+priv/aliCore.env
+priv/aliCore.exegit
+!priv/aliCore.env.example
+priv/ali_core.env
+!priv/ali_core.env.example
+
+# --- IDE / 编辑器 ---
+.idea/
+*.iml
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.cursor/*
+!.cursor/mcp.json
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
 *.swp
 *.swo
-.erlang.cookie
-ebin
-log
-erl_crash.dump
-.rebar
-logs
-.idea
-*.iml
-rebar3.crashdump
-*~
-config/aliCfg.cfg
-config.json
-rebar.lock
-.al/
+
+# --- 日志 ---
+log/
+logs/
+*.log
+
+.trae

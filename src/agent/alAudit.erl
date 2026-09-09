@@ -1,198 +1,309 @@
 %%%-------------------------------------------------------------------
-%%% @doc 工具调用审计日志模块。
-%%%
-%%% 使用 ETS 有序集合在内存中缓存最近的操作记录，同时以 JSONL
-%%% 格式追加持久化到 `.al/audit.jsonl`。记录包含会话 ID、工具名、
-%%% 经脱敏处理的参数与结果、时间戳等，供调试与合规追溯。
-%%% 内存条目超过上限时自动裁剪最旧记录。
-%%% @end
+%% @doc 审计日志：ETS ordered_set + 异步 JSONL 追加。
+%%
+%% 内存环形缓冲（最多 500 条，FIFO 裁剪），落盘为
+%% `audit-YYYYMMDD.jsonl`。写入前经 {@link alPolicy:sanitizeTerm/1}
+%% 清洗 args/results。
+%% @end
 %%%-------------------------------------------------------------------
+
 -module(alAudit).
 
--export([
-    init/0,
-    log/4,
-    list/0,
-    list/1,
-    query/1,
-    stats/0,
-    clear/0,
-    formatEntry/1
-]).
+-export([log/1, list/0, list/1, clear/0, ensureStarted/0]).
+%% Test exports
+-export([deepRedact/1]).
 
--define(TABLE, alAudit).
-%% 内存中最多保留的审计条目数
--define(MAX_ENTRIES, 500).
+-define(Table, alAudit).
+-define(MaxEntries, 500).
 
-%% @doc 初始化审计 ETS 表（幂等）。
-%% 若表已存在则跳过创建。
-%% @returns `ok`
--spec init() -> ok.
-init() ->
-    case ets:info(?TABLE) of
+%%--------------------------------------------------------------------
+%% @doc
+%% 确保审计表 ?Table 已创建。表为 public、ordered_set 类型，
+%% 同时开启读/写并发优化。已存在或创建失败均返回 ok（容忍并发
+%% 创建竞争）。
+%%
+%% @return ok
+%% @end
+%%--------------------------------------------------------------------
+ensureStarted() ->
+    case ets:whereis(?Table) of
         undefined ->
-            ets:new(?TABLE, [named_table, public, ordered_set]);
+            try ets:new(?Table, [named_table, public, ordered_set,
+                                 {read_concurrency, true},
+                                 {write_concurrency, true}]) of
+                _ -> ok
+            catch _:_ -> ok end;
         _ ->
             ok
-    end,
-    ok.
+    end.
 
-%% @doc 记录一次工具调用审计条目。
-%% 参数与结果经 {@link alPolicy:sanitizeTerm/1} 脱敏后写入 ETS 并追加到磁盘。
-%% @param SessionId 会话标识（binary）
-%% @param Tool 工具原子名
-%% @param Args 调用参数 map
-%% @param Result 执行结果 map 或 term
-%% @returns `ok`
--spec log(binary(), atom(), map(), map()) -> ok.
-log(SessionId, Tool, Args, Result) ->
-    init(),
-    Id = integer_to_binary(erlang:unique_integer([positive, monotonic])),
-    Entry = #{
-        id => Id,
-        sessionId => SessionId,
-        tool => Tool,
-        args => alPolicy:sanitizeTerm(Args),
-        result => alPolicy:sanitizeTerm(Result),
-        at => erlang:system_time(millisecond)
-    },
-    ets:insert(?TABLE, {Id, Entry}),
-    persist_entry(Entry),
-    trim(),
-    ok.
+%%%===================================================================
+%%% Log
+%%%===================================================================
 
-%% 将单条审计记录以 JSONL 行追加写入磁盘日志文件
-persist_entry(Entry) ->
-    Path = audit_log_path(),
-    ok = filelib:ensure_dir(filename:join(filename:dirname(Path), "x")),
-    Line = iolist_to_binary([llmJson:encode(Entry), <<"\n"/utf8>>]),
-    %% 使用 raw + append 模式，借助 OS 层 O_APPEND 保证短行原子追加
-    file:write_file(Path, Line, [append, raw]).
-
-%% 当 ETS 条目数超过 MAX_ENTRIES 时，从最旧键开始删除多余记录
-trim() ->
-    Size = ets:info(?TABLE, size),
-    case Size > ?MAX_ENTRIES of
-        true ->
-            ToDelete = Size - ?MAX_ENTRIES,
-            First = ets:first(?TABLE),
-            trimLoop(First, ToDelete);
-        false ->
+%%--------------------------------------------------------------------
+%% @doc
+%% 写入一条审计日志：
+%%   1. 生成单调递增的 Id 与时间戳
+%%   2. 调用 sanitizeEntry 清洗敏感字段
+%%   3. 插入 ETS 并按容量裁剪
+%%   4. 异步追加到当日 JSONL 文件（失败仅告警，不影响主流程）
+%%
+%% @param Entry 审计条目（map）
+%% @return ok
+%% @end
+%%--------------------------------------------------------------------
+log(Entry) when is_map(Entry) ->
+    try
+        ensureStarted(),
+        Id = erlang:unique_integer([positive, monotonic]),
+        Now = erlang:system_time(millisecond),
+        Sanitized = sanitizeEntry(Entry),
+        FullEntry = Sanitized#{id => Id, at => Now},
+        ets:insert(?Table, {Id, FullEntry}),
+        trim(),
+        _ = appendJsonlSafe(FullEntry),
+        ok
+    catch
+        C:R ->
+            logger:warning("audit log failed: ~p:~p", [C, R]),
             ok
     end.
 
-%% trim/0 的递归辅助：沿有序集键序删除 N 条最旧记录
-trimLoop(_Key, 0) -> ok;
-trimLoop('$end_of_table', _) -> ok;
-trimLoop(Key, N) ->
-    Next = ets:next(?TABLE, Key),
-    ets:delete(?TABLE, Key),
-    trimLoop(Next, N - 1).
+%% 安全包装：捕获 appendJsonl 的异常并告警，保证审计写入不会
+%% 因磁盘 IO 异常而影响调用方。
+appendJsonlSafe(Entry) ->
+    try appendJsonl(Entry)
+    catch C:R ->
+        logger:warning("audit jsonl append failed: ~p:~p", [C, R]),
+        ok
+    end.
 
-%% @doc 返回最近 50 条审计记录（按时间降序）。
-%% @returns `[map()]`
--spec list() -> [map()].
+%% 调用 alPolicy:sanitizeTerm/1 清洗 Entry 中的 args 与 result
+%% 字段，防止敏感信息落盘或入内存表。在 sanitizeTerm 基础上额外
+%% 对字符串叶子节点做 content 级 redact（URL 凭据、key=、私钥块、
+%% 长数字串）。
+sanitizeEntry(Entry) ->
+    SafeArgs = sanitizeTermDeep(maps:get(args, Entry, #{})),
+    SafeResult = sanitizeTermDeep(maps:get(result, Entry, #{})),
+    Entry#{args => SafeArgs, result => SafeResult}.
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 深度 sanitize：在 alPolicy:sanitizeTerm 基础上，对 map/list
+%% 中的 string/binary 叶子节点做正则 redact。
+%%--------------------------------------------------------------------
+sanitizeTermDeep(Term) ->
+    alPolicy:sanitizeTerm(deepRedact(Term)).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 递归遍历 term，对 binary/list 中的可打印字符串做 redact：
+%%   - URL 凭据：scheme://user:pass@host → scheme://<<REDACTED>>@host
+%%   - 凭据 assignment：apiKey=xxx / token: xxx / password "xxx"
+%%   - 私钥块：-----BEGIN ... PRIVATE KEY----- 整段替换
+%%   - 长数字串（>12 位）保留前 4 + 后 4
+%%--------------------------------------------------------------------
+deepRedact(Bin) when is_binary(Bin) ->
+    redactStringDeep(Bin);
+deepRedact(L) when is_list(L) ->
+    case io_lib:char_list(L) of
+        %% A charlist may contain Unicode code points above 255.
+        %% iolist_to_binary/1 only accepts bytes and crashes for paths
+        %% such as "项目说明.md"; encode charlists as UTF-8 instead.
+        true -> redactStringDeep(unicode:characters_to_binary(L));
+        false -> [deepRedact(I) || I <- L]
+    end;
+deepRedact(M) when is_map(M) ->
+    maps:from_list([{K, deepRedact(V)} || {K, V} <- maps:to_list(M)]);
+deepRedact(T) when is_tuple(T) ->
+    %% Never fold tuple_to_list through the charlist branch — integer
+    %% tuples like timestamps become binaries and list_to_tuple/1 crashes.
+    list_to_tuple([deepRedact(I) || I <- tuple_to_list(T)]);
+deepRedact(Other) ->
+    Other.
+
+redactStringDeep(Bin) ->
+    Bin1 = redactUrlCreds(Bin),
+    Bin2 = redactKeyAssignments(Bin1),
+    Bin3 = redactPrivateKey(Bin2),
+    redactLongDigits(Bin3).
+
+redactUrlCreds(Bin) ->
+    Re = <<"([a-zA-Z][a-zA-Z0-9+.-]+://)([^/@\\s]+)@">>,
+    re:replace(Bin, Re, <<"\\1<<REDACTED>>@">>, [global, {return, binary}]).
+
+redactKeyAssignments(Bin) ->
+    Keys = [<<"apiKey">>, <<"api_key">>, <<"token">>, <<"password">>, <<"secret">>,
+            <<"accessToken">>, <<"access_token">>, <<"clientSecret">>, <<"client_secret">>,
+            <<"privateKey">>, <<"private_key">>, <<"auth">>, <<"bearer">>],
+    lists:foldl(fun(K, Acc) ->
+        Re = <<"(?i)(", K/binary, ")\\s*[:=]\\s*([\"']?)([^\"'\\s,&]+)\\2">>,
+        re:replace(Acc, Re, <<"\\1=\\2<<REDACTED>>\\2">>, [global, {return, binary}])
+    end, Bin, Keys).
+
+redactPrivateKey(Bin) ->
+    Re = <<"(-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----)">>,
+    re:replace(Bin, Re, <<"<<REDACTED-PRIVATE-KEY>>">>, [global, {return, binary}]).
+
+%% 屏蔽长数字（前 4 + 后 4，中间 REDACTED）。
+redactLongDigits(Bin) ->
+    Re = <<"\\b(\\d{4})\\d{4,}(\\d{4})\\b">>,
+    re:replace(Bin, Re, <<"\\1<<REDACTED-DIGITS>>\\2">>, [global, {return, binary}]).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 内存环形缓冲裁剪：当 ETS 大小超过 ?MaxEntries（500）时，
+%% 删除最早的 Excess 条记录（ordered_set 的 first 即最旧）。
+%%
+%% @return ok
+%% @end
+%%--------------------------------------------------------------------
+trim() ->
+    %% 并行 worker 场景：建表的 worker 退出会带走表（eunit 无 alEtsOwner 时），
+    %% ets:info 对已消失的表返回 undefined——直接跳过裁剪，不让审计主流程炸。
+    case ets:info(?Table, size) of
+        Size when is_integer(Size), Size > ?MaxEntries ->
+            trimOldest(Size - ?MaxEntries);
+        _ ->
+            ok
+    end.
+
+%% 递归删除最早 N 条记录：每次取 ordered_set 的 first 删除，
+%% 直到计数归零或表空。
+trimOldest(0) -> ok;
+trimOldest(N) ->
+    case ets:first(?Table) of
+        '$end_of_table' -> ok;
+        Key ->
+            ets:delete(?Table, Key),
+            trimOldest(N - 1)
+    end.
+
+%%%===================================================================
+%%% List
+%%%===================================================================
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 列出最近的审计条目（默认上限 ?MaxEntries 条）。
+%%
+%% @return Entry 列表（按时间倒序）
+%% @end
+%%--------------------------------------------------------------------
 list() ->
-    list(50).
+    list(?MaxEntries).
 
-%% @doc 返回最近 Limit 条审计记录（按 at 字段降序）。
-%% @param Limit 最大返回条数
-%% @returns `[map()]'
--spec list(non_neg_integer()) -> [map()].
-list(Limit) ->
-    init(),
-    %% 利用 ordered_set 的键序（单调递增）从尾向前遍历，避免 ets:tab2list 全量复制。
-    collectRecent(Limit, ets:last(?TABLE), []).
+%%--------------------------------------------------------------------
+%% @doc
+%% 列出最近 Limit 条审计条目，按时间倒序返回。从 ordered_set 的
+%% last（最新）开始向前遍历。
+%%
+%% @param Limit 最大返回条数（非负整数）
+%% @return Entry 列表
+%% @end
+%%--------------------------------------------------------------------
+list(Limit) when is_integer(Limit), Limit >= 0 ->
+    ensureStarted(),
+    collectLatest(Limit, ets:last(?Table), []).
 
-%% @doc 按条件检索审计记录。
-%% Filters 可含：`tool`（atom）、`sessionId`（binary）、`since`（毫秒时间戳）、
-%% `limit`（默认 100）。结果按时间降序。
--spec query(map()) -> [map()].
-query(Filters) ->
-    init(),
-    Limit = maps:get(limit, Filters, 100),
-    Tool = maps:get(tool, Filters, undefined),
-    Session = maps:get(sessionId, Filters, undefined),
-    Since = maps:get(since, Filters, undefined),
-    %% 从 ordered_set 尾端向前遍历并过滤，命中 Limit 条即停，避免全表加载。
-    collectFiltered(Limit, Tool, Session, Since, ets:last(?TABLE), []).
-
-%% @doc 审计统计：总条目数、按工具分组的调用次数与失败次数。
--spec stats() -> map().
-stats() ->
-    init(),
-    %% 用 ets:foldl 直接聚合，不构造完整列表。
-    ByTool = ets:foldl(fun({_Key, E}, Acc) ->
-        T = maps:get(tool, E, unknown),
-        Prev = maps:get(T, Acc, #{calls => 0, errors => 0}),
-        IsErr = maps:get(ok, maps:get(result, E, #{}), true) =:= false,
-        Acc#{T => #{
-            calls => maps:get(calls, Prev) + 1,
-            errors => maps:get(errors, Prev) + case IsErr of true -> 1; false -> 0 end
-        }}
-    end, #{}, ?TABLE),
-    #{total => ets:info(?TABLE, size), byTool => ByTool}.
-
-%% 从 ordered_set 尾端向前收集最近 N 条记录（按插入时间降序）。
-collectRecent(0, _, Acc) -> lists:reverse(Acc);
-collectRecent(_, '$end_of_table', Acc) -> lists:reverse(Acc);
-collectRecent(N, Key, Acc) ->
-    case ets:lookup(?TABLE, Key) of
-        [{Key, Entry}] ->
-            collectRecent(N - 1, ets:prev(?TABLE, Key), [Entry | Acc]);
+%% 递归收集：已收集 Limit 条或表遍历完毕时终止。
+%% 从 last 向前扫时用 prepend 得到旧→新；出口再 reverse 成新→旧（倒序）。
+collectLatest(0, _Key, Acc) -> lists:reverse(Acc);
+collectLatest(_N, '$end_of_table', Acc) -> lists:reverse(Acc);
+collectLatest(N, Key, Acc) ->
+    case ets:lookup(?Table, Key) of
+        [{_, Entry} | _] ->
+            Next = ets:prev(?Table, Key),
+            collectLatest(N - 1, Next, [Entry | Acc]);
         [] ->
-            collectRecent(N, ets:prev(?TABLE, Key), Acc)
+            lists:reverse(Acc)
     end.
 
-%% 从 ordered_set 尾端向前过滤并收集最多 Limit 条记录。
-collectFiltered(0, _, _, _, _, Acc) -> lists:reverse(Acc);
-collectFiltered(_, _, _, _, '$end_of_table', Acc) -> lists:reverse(Acc);
-collectFiltered(N, Tool, Session, Since, Key, Acc) ->
-    case ets:lookup(?TABLE, Key) of
-        [{Key, Entry}] ->
-            case matchField(Tool, maps:get(tool, Entry, undefined))
-                 andalso matchField(Session, maps:get(sessionId, Entry, undefined))
-                 andalso matchSince(Since, maps:get(at, Entry, 0)) of
-                true ->
-                    collectFiltered(N - 1, Tool, Session, Since, ets:prev(?TABLE, Key), [Entry | Acc]);
-                false ->
-                    collectFiltered(N, Tool, Session, Since, ets:prev(?TABLE, Key), Acc)
-            end;
-        [] ->
-            collectFiltered(N, Tool, Session, Since, ets:prev(?TABLE, Key), Acc)
-    end.
+%%%===================================================================
+%%% Clear
+%%%===================================================================
 
-%% 字段匹配：undefined 表示不过滤。
-matchField(undefined, _) -> true;
-matchField(Want, Have) -> Want =:= Have.
-
-%% 时间下界匹配。
-matchSince(undefined, _) -> true;
-matchSince(Since, At) -> At >= Since.
-
-%% @doc 清空内存中的全部审计条目（不删除磁盘 JSONL 文件）。
-%% @returns `ok`
--spec clear() -> ok.
+%%--------------------------------------------------------------------
+%% @doc
+%% 清空内存中的所有审计条目（不影响已落盘的 JSONL 文件）。
+%%
+%% @return ok
+%% @end
+%%--------------------------------------------------------------------
 clear() ->
-    init(),
-    ets:delete_all_objects(?TABLE),
+    ensureStarted(),
+    ets:delete_all_objects(?Table),
     ok.
 
-%% @doc 将单条审计记录格式化为可读字符串，用于日志或 CLI 展示。
-%% @param Entry 含 tool、at、sessionId 等字段的 map
-%% @returns `{string()}` 形如 `[YYYY-MM-DD HH:MM:SS] tool=... session=...`
--spec formatEntry(map()) -> string().
-formatEntry(#{tool := Tool, at := At} = Entry) ->
-    io_lib:format("[~s] tool=~p session=~s",
-                  [formatTime(At), Tool, maps:get(sessionId, Entry, <<>>)]).
+%%%===================================================================
+%%% JSONL persistence
+%%%===================================================================
 
-%% 将毫秒时间戳格式化为 UTC 日期时间字符串
-formatTime(Ms) ->
-    {{Y, Mo, D}, {H, Mi, S}} = calendar:system_time_to_universal_time(Ms, millisecond),
-    io_lib:format("~4..0w-~2..0w-~2..0w ~2..0w:~2..0w:~2..0w",
-                  [Y, Mo, D, H, Mi, S]).
+%%--------------------------------------------------------------------
+%% @doc
+%% 把单条审计 Entry 以 JSONL 格式追加写入当日审计文件
+%% （audit-YYYYMMDD.jsonl）。使用 [append, raw] 提升追加性能。
+%%
+%% @param Entry 审计条目
+%% @return ok
+%% @end
+%%--------------------------------------------------------------------
+appendJsonl(Entry) ->
+    Path = auditLogPath(),
+    Line = [alJson:encode(Entry), $\n],
+    case file:write_file(Path, Line, [append, raw]) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            logger:warning("audit jsonl append failed for ~p: ~p", [Path, Reason]),
+            {error, Reason}
+    end.
 
-%% 返回项目根目录下 `.al/audit.jsonl` 的绝对路径
-audit_log_path() ->
-    Root = alToolProject:findProjectRootFromModule(),
-    filename:join(Root, ".al/audit.jsonl").
+%%--------------------------------------------------------------------
+%% @doc
+%% 计算当日审计文件路径：先确保目录存在，再按当前日期生成
+%% 文件名 audit-YYYYMMDD.jsonl。
+%%
+%% @return 文件路径（string）
+%% @end
+%%--------------------------------------------------------------------
+auditLogPath() ->
+    Dir = auditDir(),
+    ok = filelib:ensure_dir(filename:join(Dir, "dummy")),
+    Date = dateSuffix(erlang:system_time(millisecond)),
+    filename:join(Dir, "audit-" ++ Date ++ ".jsonl").
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 读取审计目录配置：alConfig 中的 auditDir，未配置时默认 `<dataDir>/audit`。
+%%
+%% @return 目录路径（string）
+%% @end
+%%--------------------------------------------------------------------
+auditDir() ->
+    case alConfig:get(auditDir, undefined) of
+        undefined -> alConfig:dataPath("audit");
+        Dir ->
+            case filename:pathtype(toList(Dir)) of
+                relative -> alConfig:resolvePath(alConfig:root(), Dir);
+                _ -> filename:absname(toList(Dir))
+            end
+    end.
+
+toList(V) when is_list(V) -> V;
+toList(V) when is_binary(V) -> unicode:characters_to_list(V);
+toList(V) -> lists:flatten(io_lib:format("~p", [V])).
+
+%%--------------------------------------------------------------------
+%% @doc
+%% 由毫秒时间戳生成 YYYYMMDD 日期后缀，用作审计文件名分段。
+%%
+%% @param Ms 毫秒时间戳
+%% @return 8 位日期字符串（如 "20260705"）
+%% @end
+%%--------------------------------------------------------------------
+dateSuffix(Ms) ->
+    DateTime = calendar:system_time_to_universal_time(Ms, millisecond),
+    {{Y, M, D}, _} = DateTime,
+    lists:flatten(io_lib:format("~4..0B~2..0B~2..0B", [Y, M, D])).

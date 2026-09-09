@@ -1,0 +1,22 @@
+; llama-server 多模型预设示例（embedding + rerank）
+; 用法:
+;   llama-server --host 127.0.0.1 --port 8081 --models-preset priv/examples/llama-models.ini.example --models-max 2
+; 节名即 aliCfg 里 embedding.model / rerank.model 要与 API 请求一致
+; 路径改为本机 GGUF 绝对路径
+
+[*]
+batch-size = 2048
+ubatch-size = 512
+
+[Qwen3-Embedding-4B]
+model = /path/to/qwen3-embedding-4b-q4_k_m.gguf
+embedding = true
+pooling = last
+ctx-size = 8192
+
+[Qwen3-Reranker-4B]
+model = /path/to/Qwen3-Reranker-4B-f16.gguf
+reranking = true
+pooling = rank
+embedding = true
+ctx-size = 8192

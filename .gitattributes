@@ -1,0 +1,13 @@
+# Unix shell scripts MUST use LF line endings; CRLF causes
+# "set: -\r: invalid option" errors when run under sh/bash on Linux.
+*.sh           text eol=lf
+*.ps1          text eol=crlf
+
+# Erlang/Rust sources: keep LF for cross-platform consistency.
+*.erl          text eol=lf
+*.hrl          text eol=lf
+*.app.src      text eol=lf
+*.config       text eol=lf
+*.rs           text eol=lf
+*.toml         text eol=lf
+*.cfg          text eol=lf

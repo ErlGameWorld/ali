@@ -1,76 +1,141 @@
 %%%-------------------------------------------------------------------
-%%% @doc ali 应用的顶层监督者。
-%%%
-%%% 监督策略：`one_for_one`，子进程互不影响。
-%%%
-%%% 默认子进程：
-%%% <ul>
-%%%   <li>{@link alCodeIndexer} — 项目 .erl 代码索引</li>
-%%%   <li>{@link alServer} — Agent 核心 gen_server</li>
-%%%   <li>{@link alWebSup} — Web 子系统（连接监督 + HTTP 服务）</li>
-%%% </ul>
-%%%
-%%% {@link alWebSrv} 在 {@link alWebSup} 下常驻启动；HTTP 监听仍由
-%%% {@link alWebSrv:startWeb/0} 按需开启。
-%%% @end
+%% @doc ali 顶层 supervisor。
+%% @end
 %%%-------------------------------------------------------------------
+
 -module(ali_sup).
 
 -behaviour(supervisor).
 
--export([start_link/0, startIndexer/0, init/1]).
+-export([start_link/0]).
+
+-export([init/1]).
 
 -define(SERVER, ?MODULE).
 
-%% @doc 启动监督者，注册名为 `ali_sup`。
--spec start_link() -> {ok, pid()} | {error, term()}.
+%%--------------------------------------------------------------------
+%% @doc
+%% 创建并链接顶层 supervisor 进程，注册为本地名 ?SERVER。
+%%
+%% @return {ok, Pid} | {error, Reason}
+%% @end
+%%--------------------------------------------------------------------
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc 动态添加代码索引器子进程（索引器通常已在 init/1 中启动，本函数供按需扩容）。
--spec startIndexer() -> supervisor:startchild_ret().
-startIndexer() ->
-    supervisor:start_child(?SERVER, #{
-        id => alCodeIndexer,
-        start => {alCodeIndexer, startLink, []},
-        restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [alCodeIndexer]
-    }).
-
-%% @doc 初始化监督树与子进程规格。
--spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+%%--------------------------------------------------------------------
+%% @doc
+%% supervisor 初始化回调：定义重启策略（one_for_one，5 次/10 秒）
+%% 与所有子进程规格。启动顺序：alQdrant → alLocalDb →
+%% alSessionMgr → alCoreClient → alServer →
+%% alWebSup。Web 子系统最后启动，确保其依赖的 session_mgr
+%% 与 alServer 已就绪。
+%%
+%% @param [] 初始参数（空）
+%% @return {ok, {SupFlags, ChildSpecs}}
+%% @end
+%%--------------------------------------------------------------------
+%% sup_flags() = #{strategy => strategy(),         % optional
+%%                 intensity => non_neg_integer(), % optional
+%%                 period => pos_integer()}        % optional
+%% child_spec() = #{id => child_id(),       % mandatory
+%%                  start => mfargs(),      % mandatory
+%%                  restart => restart(),   % optional
+%%                  shutdown => shutdown(), % optional
+%%                  type => worker(),       % optional
+%%                  modules => modules()}   % optional
 init([]) ->
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
-        period => 60
+        period => 10
     },
+    %% alEtsOwner 最先启动：作为公共 ETS 表（plan/token/patch 事务/
+    %% audit/metrics/progress/task）的长生命周期属主，避免短命 agent
+    %% worker 建表后退出导致这些表被销毁、状态静默丢失。
+    %% Web 最后启动：HTTP/WS 依赖 session_mgr + alServer。
     ChildSpecs = [
         #{
-            id => alCodeIndexer,
-            start => {alCodeIndexer, startLink, []},
+            id => alEtsOwner,
+            start => {alEtsOwner, start_link, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
-            modules => [alCodeIndexer]
+            modules => [alEtsOwner]
+        },
+        #{
+            id => alQdrant,
+            start => {alQdrant, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alQdrant]
+        },
+        #{
+            id => alLocalDb,
+            start => {alLocalDb, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alLocalDb]
+        },
+        #{
+            id => alSessionMgr,
+            start => {alSessionMgr, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alSessionMgr]
+        },
+        #{
+            id => alCoreClient,
+            start => {alCoreClient, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alCoreClient]
+        },
+        %% alFileWatcher 默认 ignore（fileWatchEnabled=false 时）；
+        %% 启用时监听源文件 mtime 变化，触发异步重索引。
+        #{
+            id => alFileWatcher,
+            start => {alFileWatcher, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alFileWatcher]
+        },
+        #{
+            id => alSessionSup,
+            start => {alSessionSup, start_link, []},
+            restart => permanent,
+            shutdown => infinity,
+            type => supervisor,
+            modules => [alSessionSup]
+        },
+        #{
+            id => alPending,
+            start => {alPending, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [alPending]
         },
         #{
             id => alServer,
-            start => {alServer, startLink, []},
+            start => {alServer, start_link, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
             modules => [alServer]
         },
         #{
-            id => alMcp,
-            start => {alMcp, start_link, []},
+            id => alArchiver,
+            start => {alArchiver, start_link, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
-            modules => [alMcp]
+            modules => [alArchiver]
         },
         #{
             id => alWebSup,
@@ -82,3 +147,5 @@ init([]) ->
         }
     ],
     {ok, {SupFlags, ChildSpecs}}.
+
+%% internal functions

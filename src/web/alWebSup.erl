@@ -1,11 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% @doc Web 子系统监督者。
-%%%
-%%% 统一管理 {@link alWebConnSup}（HTTP/WS 连接 worker）与
-%%% {@link alWebSrv}（HTTP 监听管理）。任一子进程崩溃时由本监督者
-%%% 按 `one_for_one` 策略独立重启，不影响 ali 顶层其它服务。
-%%% @end
+%% @doc Web 子系统 supervisor。
+%%
+%% 管理 alWebConnSup（HTTP/WS 连接 worker）与 alHttpGateway（eWSrv 监听）。
+%% 任一子进程崩溃会独立重启，不影响其他 ali 顶层服务。
+%% @end
 %%%-------------------------------------------------------------------
+
 -module(alWebSup).
 
 -behaviour(supervisor).
@@ -14,13 +14,27 @@
 
 -define(SERVER, ?MODULE).
 
-%% @doc 启动 Web 监督者，注册名为 `alWebSup`。
--spec start_link() -> {ok, pid()} | {error, term()}.
+%%--------------------------------------------------------------------
+%% @doc
+%% 创建并链接 Web 子系统 supervisor，注册为本地名 ?SERVER。
+%%
+%% @return {ok, Pid} | {error, Reason}
+%% @end
+%%--------------------------------------------------------------------
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc 初始化 Web 监督树。
--spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+%%--------------------------------------------------------------------
+%% @doc
+%% supervisor 初始化回调：管理两个子进程——alWebConnSup
+%% （HTTP/WS 连接 supervisor）与 alHttpGateway（eWSrv 监听器）。
+%% 采用 one_for_one 策略，任一子进程崩溃不会影响另一个，可被
+%% 独立重启。
+%%
+%% @param [] 初始参数（空）
+%% @return {ok, {SupFlags, ChildSpecs}}
+%% @end
+%%--------------------------------------------------------------------
 init([]) ->
     SupFlags = #{
         strategy => one_for_one,
@@ -37,12 +51,12 @@ init([]) ->
             modules => [alWebConnSup]
         },
         #{
-            id => alWebSrv,
-            start => {alWebSrv, startLink, []},
+            id => alHttpGateway,
+            start => {alHttpGateway, start_link, []},
             restart => permanent,
             shutdown => 5000,
             type => worker,
-            modules => [alWebSrv]
+            modules => [alHttpGateway]
         }
     ],
     {ok, {SupFlags, ChildSpecs}}.

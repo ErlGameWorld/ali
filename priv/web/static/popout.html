@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ali 弹出窗</title>
+  <link rel="stylesheet" href="/static/popout.css">
+</head>
+<body>
+  <header class="bar">
+    <strong id="title" class="title">…</strong>
+    <span id="meta" class="meta muted"></span>
+    <div id="actions" class="actions"></div>
+  </header>
+  <div id="searchRow" class="search-row hidden">
+    <input id="searchInput" type="search" placeholder="搜索…" autocomplete="off" spellcheck="false">
+    <label class="case-label" title="区分大小写"><input id="searchCase" type="checkbox"> Aa</label>
+    <span id="searchCount" class="muted count">0/0</span>
+    <button type="button" class="btn" id="btnFindPrev" title="上一个">↑</button>
+    <button type="button" class="btn" id="btnFindNext" title="下一个">↓</button>
+  </div>
+  <div id="graphSearchRow" class="search-row hidden">
+    <input id="graphSearch" type="search" placeholder="高亮节点名…" autocomplete="off" spellcheck="false">
+    <span id="graphSearchCount" class="muted count">0</span>
+    <span class="muted hint">滚轮缩放 · 拖拽平移 · Enter/居中 = 指定函数到窗口中央</span>
+  </div>
+  <main class="main">
+    <div id="fileBody" class="file-body hidden" tabindex="0"></div>
+    <div id="thinkingBody" class="thinking-body hidden" tabindex="0"></div>
+    <div id="graphBody" class="graph-body hidden">
+      <div id="graphViewport" class="graph-viewport" tabindex="0">
+        <div id="graphCanvas" class="graph-canvas"></div>
+      </div>
+      <aside id="graphDetail" class="graph-detail">
+        <div class="graph-detail-title">节点详情</div>
+        <div id="graphDetailBody" class="graph-detail-body muted">点击图中节点查看详情</div>
+      </aside>
+    </div>
+  </main>
+  <pre id="graphSource" class="graph-source hidden"></pre>
+  <div id="status" class="status muted"></div>
+  <script src="/static/mermaid.min.js"></script>
+  <script>
+    if (window.mermaid) {
+      mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' });
+    }
+  </script>
+  <script src="/static/popout.js"></script>
+</body>
+</html>

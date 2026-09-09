@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "updated": "2026-09",
+  "providers": [
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "defaultModel": "gemini-3.8-flash",
+      "modelGroups": [
+        {
+          "label": "Gemini Flash",
+          "models": [
+            {"id": "gemini-3.8-flash", "label": "gemini-3.8-flash"},
+            {"id": "gemini-flash-latest", "label": "gemini-flash-latest"},
+            {"id": "gemini-2.5-flash", "label": "gemini-2.5-flash"}
+          ]
+        },
+        {
+          "label": "Gemini Pro",
+          "models": [
+            {"id": "gemini-2.5-pro", "label": "gemini-2.5-pro"},
+            {"id": "gemini-pro-latest", "label": "gemini-pro-latest"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "defaultModel": "deepseek-v4-flash",
+      "modelGroups": [
+        {
+          "label": "DeepSeek V4",
+          "models": [
+            {"id": "deepseek-v4-pro", "label": "deepseek-v4-pro"},
+            {"id": "deepseek-v4-flash", "label": "deepseek-v4-flash"}
+          ]
+        },
+        {
+          "label": "DeepSeek 推理",
+          "models": [
+            {"id": "deepseek-reasoner", "label": "deepseek-reasoner"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "defaultModel": "gpt-5.6-sol",
+      "modelGroups": [
+        {
+          "label": "GPT-5.6",
+          "models": [
+            {"id": "gpt-5.6-sol", "label": "gpt-5.6-sol"},
+            {"id": "gpt-5.6-terra", "label": "gpt-5.6-terra"},
+            {"id": "gpt-5.6-luna", "label": "gpt-5.6-luna"},
+            {"id": "gpt-5.6", "label": "gpt-5.6"}
+          ]
+        },
+        {
+          "label": "GPT-5",
+          "models": [
+            {"id": "gpt-5.2", "label": "gpt-5.2"},
+            {"id": "gpt-5.1", "label": "gpt-5.1"},
+            {"id": "gpt-5", "label": "gpt-5"}
+          ]
+        },
+        {
+          "label": "OpenAI 推理",
+          "models": [
+            {"id": "o3", "label": "o3"},
+            {"id": "o4-mini", "label": "o4-mini"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama（本地）",
+      "defaultModel": "qwen3:14b",
+      "modelGroups": [
+        {
+          "label": "Qwen3 本地",
+          "models": [
+            {"id": "qwen3:14b", "label": "qwen3:14b"},
+            {"id": "qwen3:8b", "label": "qwen3:8b"},
+            {"id": "qwen3:4b", "label": "qwen3:4b"}
+          ]
+        },
+        {
+          "label": "DeepSeek 本地",
+          "models": [
+            {"id": "deepseek-r1:14b", "label": "deepseek-r1:14b"},
+            {"id": "deepseek-r1:8b", "label": "deepseek-r1:8b"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "llamaCpp",
+      "name": "llama.cpp（本地）",
+      "defaultModel": "qwen3-14b-q4",
+      "modelGroups": [
+        {
+          "label": "GGUF 常用",
+          "models": [
+            {"id": "qwen3-14b-q4", "label": "qwen3-14b-q4"},
+            {"id": "llama-3.3-70b-q4", "label": "llama-3.3-70b-q4"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "vllm",
+      "name": "vLLM（本地）",
+      "defaultModel": "Qwen/Qwen3-14B",
+      "modelGroups": [
+        {
+          "label": "vLLM OpenAI 兼容",
+          "models": [
+            {"id": "Qwen/Qwen3-14B", "label": "Qwen/Qwen3-14B"},
+            {"id": "Qwen/Qwen3-32B", "label": "Qwen/Qwen3-32B"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lmstudio",
+      "name": "LM Studio（本地）",
+      "defaultModel": "qwen3-14b",
+      "modelGroups": [
+        {
+          "label": "LM Studio 本地",
+          "models": [
+            {"id": "qwen3-14b", "label": "qwen3-14b"},
+            {"id": "gemma-3-12b", "label": "gemma-3-12b"}
+          ]
+        }
+      ]
+    }
+  ]
+}

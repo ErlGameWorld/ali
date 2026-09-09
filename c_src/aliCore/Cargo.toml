@@ -1,0 +1,39 @@
+# aliCore — Erlang Port 子进程数据面（索引 / 检索 / SQLite / 调用图 / 可选向量库）
+# 注意：crate name 保持 "aliCore" 不改。Erlang 侧 alCoreClient 通过
+# priv/aliCore.exe 路径引用产物，改名会破坏部署路径（任务 #19 标注延期不改）。
+[package]
+name = "aliCore"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "aliCore"
+path = "src/main.rs"
+
+[[bench]]
+name = "core_micro"
+harness = false
+
+[dependencies]
+anyhow = "1.0.103"
+qdrant-client = "1.18.0"
+reqwest = { version = "0.13.4", features = ["json", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tantivy = "0.26.1"
+# tokio features 精简：仅启用实际使用的多线程 runtime / macros / signal / sync / time，
+# 避免启用 "full" 拉入 fs/process/net 等未使用模块（任务 #18）。
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tree-sitter = "0.26.10"
+tree-sitter-erlang = "0.19.0"
+walkdir = "2.5.0"
+rayon = "1.11.0"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+hnsw_rs = "0.3.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

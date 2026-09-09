@@ -4,16 +4,154 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ali Web</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=hl8">
 </head>
 <body>
+  <div class="shell">
+  <aside id="historyRail" class="history-rail" aria-label="历史会话" hidden>
+    <div class="history-rail-top">
+      <button id="btnNewChat" type="button" class="history-new-btn">开启新对话</button>
+      <button id="btnHistoryClose" type="button" class="btn-muted btn-xs" title="关闭">×</button>
+    </div>
+    <div id="historyList" class="history-list"></div>
+    <div class="history-rail-foot muted">本地保存 · 最多 20 条 / 30 天</div>
+  </aside>
+  <div id="historyBackdrop" class="history-backdrop hidden" aria-hidden="true"></div>
+  <div class="shell-main">
   <div class="layout">
     <header class="header">
       <span class="brand-title">ali</span>
       <span class="brand-meta">Erlang 节点内智能开发助手 · edit 模式写文件需「批准执行」</span>
       <span id="connDot" class="conn-dot" title="连接状态">●</span>
+      <button id="btnLlm" type="button" class="btn-muted btn-xs" title="自选模型与 API Key">模型</button>
       <button id="btnToken" type="button" class="btn-muted btn-xs" title="设置 Web API Token">Token</button>
     </header>
+
+    <div id="llmModal" class="modal hidden" role="dialog" aria-labelledby="llmModalTitle">
+      <div class="modal-card">
+        <h2 id="llmModalTitle" class="modal-title">LLM 连接</h2>
+        <p class="modal-hint">勾选后仅覆盖<strong>云端</strong>模型与 API Key（会话内存，不写 cfg）。若服务器配置了本地模型链，仍先本地尝试、答不好再升云。API Key 留空则用服务器 cfg 密钥。</p>
+        <p id="llmLocalInfo" class="modal-hint muted hidden"></p>
+        <label class="modal-check">
+          <input type="checkbox" id="llmUseOwn"> 使用自定义云模型（未勾选则用服务器默认云端配置）
+        </label>
+        <label class="modal-field">云提供商
+          <select id="llmProviderSelect"></select>
+        </label>
+        <label class="modal-field">云模型
+          <select id="llmModelSelect"></select>
+        </label>
+        <label class="modal-field">云 API Key
+          <input type="password" id="llmApiKeyInput" autocomplete="off" placeholder="sk-...（必填才能用自己的 Key；留空=服务器 Key）">
+        </label>
+        <div class="modal-actions">
+          <button id="btnLlmSave" type="button">保存</button>
+          <button id="btnLlmCancel" type="button" class="btn-muted">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="fileViewer" class="file-viewer hidden" role="dialog" aria-modal="true" aria-labelledby="fileViewerTitle">
+      <div id="fileViewerPanel" class="file-viewer-panel">
+        <div id="fileViewerDrag" class="file-viewer-bar" title="拖动移动窗口">
+          <strong id="fileViewerTitle" class="file-viewer-title">文件</strong>
+          <div class="file-viewer-actions">
+            <button id="btnFvZoomOut" type="button" class="btn-muted btn-xs" title="缩小">A−</button>
+            <span id="fileViewerZoom" class="muted file-viewer-zoom">100%</span>
+            <button id="btnFvZoomIn" type="button" class="btn-muted btn-xs" title="放大">A+</button>
+            <button id="btnFvCopy" type="button" class="btn-muted btn-xs" title="复制全部">复制</button>
+            <button id="btnFvCopySel" type="button" class="btn-muted btn-xs" title="复制选中">复制选中</button>
+            <button id="btnFvInsert" type="button" class="btn-muted btn-xs" title="插入 @path">引用</button>
+            <button id="btnFvEdit" type="button" class="btn-muted btn-xs" title="编辑文件内容">编辑</button>
+            <button id="btnFvEditCancel" type="button" class="btn-muted btn-xs hidden" title="放弃修改（Esc）">取消</button>
+            <button id="btnFvFullscreen" type="button" class="btn-muted btn-xs" title="全屏">全屏</button>
+            <button id="btnFvPopout" type="button" class="btn-muted btn-xs" title="弹出独立窗口（可拖到另一块屏）">弹出</button>
+            <button id="btnFvClose" type="button" class="btn-muted btn-xs" title="关闭">×</button>
+          </div>
+        </div>
+        <div id="fileViewerMeta" class="file-viewer-meta muted"></div>
+        <div class="file-viewer-search">
+          <input id="fileViewerSearch" type="search" placeholder="搜索内容…（Ctrl+F）" autocomplete="off" spellcheck="false">
+          <label class="file-viewer-search-case" title="区分大小写">
+            <input id="fileViewerSearchCase" type="checkbox"> Aa
+          </label>
+          <span id="fileViewerSearchCount" class="muted file-viewer-search-count">0/0</span>
+          <button id="btnFvFindPrev" type="button" class="btn-muted btn-xs" title="上一个（Shift+Enter）">↑</button>
+          <button id="btnFvFindNext" type="button" class="btn-muted btn-xs" title="下一个（Enter）">↓</button>
+        </div>
+        <div id="fileViewerBody" class="file-viewer-body" tabindex="0">加载中…</div>
+        <textarea id="fileViewerEditor" class="file-viewer-editor hidden" spellcheck="false" placeholder="在此编辑文件内容…"></textarea>
+      </div>
+    </div>
+
+    <div id="thinkingViewer" class="file-viewer hidden" role="dialog" aria-modal="true" aria-labelledby="thinkingViewerTitle">
+      <div id="thinkingViewerPanel" class="file-viewer-panel">
+        <div id="thinkingViewerDrag" class="file-viewer-bar" title="拖动移动窗口">
+          <strong id="thinkingViewerTitle" class="file-viewer-title">思考过程</strong>
+          <div class="file-viewer-actions">
+            <button id="btnTvZoomOut" type="button" class="btn-muted btn-xs" title="缩小">A−</button>
+            <span id="thinkingViewerZoom" class="muted file-viewer-zoom">100%</span>
+            <button id="btnTvZoomIn" type="button" class="btn-muted btn-xs" title="放大">A+</button>
+            <button id="btnTvCopy" type="button" class="btn-muted btn-xs" title="复制全部">复制</button>
+            <button id="btnTvCopySel" type="button" class="btn-muted btn-xs" title="复制选中">复制选中</button>
+            <button id="btnTvFullscreen" type="button" class="btn-muted btn-xs" title="全屏">全屏</button>
+            <button id="btnTvPopout" type="button" class="btn-muted btn-xs" title="弹出独立窗口（可拖到另一块屏）">弹出</button>
+            <button id="btnTvClose" type="button" class="btn-muted btn-xs" title="关闭">×</button>
+          </div>
+        </div>
+        <div id="thinkingViewerMeta" class="file-viewer-meta muted"></div>
+        <div class="file-viewer-search">
+          <input id="thinkingViewerSearch" type="search" placeholder="搜索思考步骤…（Ctrl+F）" autocomplete="off" spellcheck="false">
+          <label class="file-viewer-search-case" title="区分大小写">
+            <input id="thinkingViewerSearchCase" type="checkbox"> Aa
+          </label>
+          <span id="thinkingViewerSearchCount" class="muted file-viewer-search-count">0/0</span>
+          <button id="btnTvFindPrev" type="button" class="btn-muted btn-xs" title="上一个（Shift+Enter）">↑</button>
+          <button id="btnTvFindNext" type="button" class="btn-muted btn-xs" title="下一个（Enter）">↓</button>
+        </div>
+        <div id="thinkingViewerBody" class="thinking-viewer-body" tabindex="0"></div>
+      </div>
+    </div>
+
+    <div id="graphViewer" class="graph-viewer hidden" role="dialog" aria-modal="true" aria-labelledby="graphViewerTitle">
+      <div id="graphViewerPanel" class="graph-viewer-panel">
+        <div id="graphViewerDrag" class="graph-viewer-bar" title="拖动移动窗口">
+          <strong id="graphViewerTitle" class="graph-viewer-title">调用图</strong>
+          <div class="graph-viewer-actions">
+            <button id="btnGvPrev" type="button" class="btn-muted btn-xs" title="上一张图">‹</button>
+            <button id="btnGvNext" type="button" class="btn-muted btn-xs" title="下一张图">›</button>
+            <button id="btnGvZoomOut" type="button" class="btn-muted btn-xs" title="缩小（滚轮）">−</button>
+            <span id="graphViewerZoom" class="muted graph-viewer-zoom">100%</span>
+            <button id="btnGvZoomIn" type="button" class="btn-muted btn-xs" title="放大（滚轮）">+</button>
+            <button id="btnGvFit" type="button" class="btn-muted btn-xs" title="适配窗口">适配</button>
+            <button id="btnGvReset" type="button" class="btn-muted btn-xs" title="重置视图">重置</button>
+            <button id="btnGvCopy" type="button" class="btn-muted btn-xs" title="复制 Mermaid 源码">复制源码</button>
+            <button id="btnGvDlSvg" type="button" class="btn-muted btn-xs" title="下载 SVG">SVG</button>
+            <button id="btnGvDlMmd" type="button" class="btn-muted btn-xs" title="下载 .mmd">MMD</button>
+            <button id="btnGvSource" type="button" class="btn-muted btn-xs" title="显示/隐藏源码">源码</button>
+            <button id="btnGvFullscreen" type="button" class="btn-muted btn-xs" title="全屏">全屏</button>
+            <button id="btnGvPopout" type="button" class="btn-muted btn-xs" title="弹出独立窗口（可拖到另一块屏）">弹出</button>
+            <button id="btnGvClose" type="button" class="btn-muted btn-xs" title="关闭">×</button>
+          </div>
+        </div>
+        <div id="graphViewerMeta" class="graph-viewer-meta muted"></div>
+        <div class="graph-viewer-search">
+          <input id="graphViewerSearch" type="search" placeholder="高亮节点名…（如 town_lib:broadcast/2）" autocomplete="off" spellcheck="false">
+          <span id="graphViewerSearchCount" class="muted graph-viewer-search-count">0</span>
+          <span class="muted graph-viewer-hint">滚轮缩放 · 拖拽平移 · 点击节点看详情</span>
+        </div>
+        <div class="graph-viewer-body">
+          <div id="graphViewerViewport" class="graph-viewer-viewport" tabindex="0" title="拖拽平移，滚轮缩放">
+            <div id="graphViewerCanvas" class="graph-viewer-canvas"></div>
+          </div>
+          <aside id="graphViewerDetail" class="graph-viewer-detail">
+            <div class="graph-viewer-detail-title">节点详情</div>
+            <div id="graphViewerDetailBody" class="graph-viewer-detail-body muted">点击图中节点查看模块 / 函数 / 元数 / 调用点</div>
+          </aside>
+        </div>
+        <pre id="graphViewerSource" class="graph-viewer-source hidden"></pre>
+      </div>
+    </div>
 
     <div id="approveBar" class="approve-bar hidden">
       <div class="approve-row">
@@ -23,51 +161,37 @@
           <button id="btnDismissApprove" type="button" class="btn-muted">忽略</button>
         </span>
       </div>
-      <pre id="approveDiff" class="diff-view hidden"></pre>
     </div>
 
     <div class="body">
       <main class="chat" id="chat"></main>
-
-      <aside id="sidePanel" class="side-panel hidden">
-        <div class="side-tabs">
-          <button class="side-tab active" data-tab="tasks" type="button">任务</button>
-          <button class="side-tab" data-tab="plan" type="button">规划</button>
-          <button class="side-tab" data-tab="metrics" type="button">指标</button>
-          <button id="btnCloseSide" class="btn-muted side-close" type="button">×</button>
-        </div>
-        <div id="tabTasks" class="side-body"><ul id="tasksList"></ul></div>
-        <div id="tabPlan" class="side-body hidden"><ul id="planList"></ul></div>
-        <div id="tabMetrics" class="side-body hidden"><div id="metricsBox"></div></div>
-      </aside>
     </div>
 
     <footer class="composer">
       <div id="attachPreview" class="attach-preview hidden"></div>
-      <textarea id="prompt" rows="2" placeholder="输入问题，例如：分析 alLoop 的工作流程"></textarea>
+      <textarea id="prompt" rows="2" placeholder="支持 @module / @path / @mfa，例如：@mfa alAgent:run/2 的调用链是什么？"></textarea>
       <div class="composer-bar">
         <div class="composer-left">
           <input type="file" id="fileInput" multiple hidden
-            accept="image/*,.pdf,.erl,.hrl,.md,.txt,.json,.yaml,.yml,.cfg,.conf,.js,.ts,.jsx,.tsx,.html,.css,.xml,.csv,.toml,.ini,.py,.go,.rs,.java,.c,.cpp,.h,.sql,.sh,.src,.app,.config,.vue,.svelte,.kt,.swift,.rb,.php,.lua,.proto">
+            accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.epub,.patch,.diff,.ipynb,.svg,.erl,.hrl,.md,.txt,.json,.yaml,.yml,.cfg,.conf,.js,.ts,.jsx,.tsx,.html,.css,.xml,.csv,.toml,.ini,.py,.go,.rs,.java,.c,.cpp,.h,.sql,.sh,.src,.app,.config,.vue,.svelte,.kt,.swift,.rb,.php,.lua,.proto">
           <button id="btnAttach" type="button" class="btn-muted btn-xs">附件</button>
           <label>模式
             <select id="modeSelect">
               <option value="ask">ask（只读）</option>
+              <option value="plan">plan（规划）</option>
               <option value="edit">edit（编辑）</option>
               <option value="exec">exec（执行）</option>
             </select>
           </label>
-          <label>会话
-            <select id="sessionSelect">
-              <option value="web">web（默认）</option>
-            </select>
-          </label>
-          <button id="btnSaveSession" type="button" class="btn-muted btn-xs">保存</button>
-          <button id="btnDeleteSession" type="button" class="btn-muted btn-xs">删除</button>
-          <button id="btnRefreshIndex" type="button" class="btn-muted btn-xs">索引</button>
-          <button id="btnTasks" type="button" class="btn-muted btn-xs">面板</button>
-          <button id="btnClear" type="button" class="btn-muted btn-xs">清空</button>
-          <button id="btnEunit" type="button" class="btn-muted btn-xs">EUnit</button>
+          <select id="sessionSelect" class="hidden" aria-hidden="true">
+            <option value="web">web</option>
+          </select>
+          <button id="btnSaveSession" type="button" class="btn-muted btn-xs hidden">保存</button>
+          <button id="btnDeleteSession" type="button" class="btn-muted btn-xs hidden">删除</button>
+          <button id="btnHistory" type="button" class="btn-muted btn-xs" title="打开/关闭本地历史会话" aria-pressed="false">历史会话</button>
+          <button id="btnDistill" type="button" class="btn-muted btn-xs" title="把当前会话蒸馏为长期记忆（侧栏「记忆经验」可查看）">蒸馏</button>
+          <button id="btnClear" type="button" class="btn-muted btn-xs" title="清空当前对话">清空</button>
+          <button id="btnTasks" type="button" class="btn-muted btn-xs" title="任务、Core 索引、文件树等">信息面板</button>
         </div>
         <div class="composer-right">
           <span id="statusText" class="status">就绪</span>
@@ -77,9 +201,120 @@
       </div>
     </footer>
   </div>
+
+      <aside id="sidePanel" class="side-panel hidden">
+        <div class="side-tabs">
+          <button class="side-tab" data-tab="files" type="button">文件</button>
+          <button class="side-tab" data-tab="graphs" type="button">图</button>
+          <button class="side-tab active" data-tab="tasks" type="button">任务</button>
+          <button class="side-tab" data-tab="plan" type="button">规划</button>
+          <button class="side-tab" data-tab="sessions" type="button">会话</button>
+          <button class="side-tab" data-tab="checkpoints" type="button">恢复</button>
+          <button class="side-tab" data-tab="metrics" type="button">指标</button>
+          <button class="side-tab" data-tab="audit" type="button">审计</button>
+          <button class="side-tab" data-tab="tools" type="button">工具</button>
+          <button class="side-tab" data-tab="tokens" type="button">Token</button>
+          <button class="side-tab" data-tab="memory" type="button">记忆经验</button>
+          <button class="side-tab" data-tab="knowledge" type="button">知识库</button>
+          <button class="side-tab" data-tab="core" type="button">Core</button>
+          <button id="btnCloseSide" class="btn-muted side-close" type="button">×</button>
+        </div>
+        <div id="tabTasks" class="side-body"><ul id="tasksList"></ul></div>
+        <div id="tabPlan" class="side-body hidden"><ul id="planList"></ul></div>
+        <div id="tabFiles" class="side-body hidden files-pane">
+          <div class="side-toolbar">
+            <button id="btnFilesRefresh" type="button" class="btn-muted btn-xs">刷新</button>
+            <span class="muted">点击文件打开查看器</span>
+            <span id="filesRootLabel" class="muted side-note" title="对应 aliCfg.cfg → agent.projectRoot"></span>
+          </div>
+          <div id="filesTree" class="files-tree-only"></div>
+        </div>
+        <div id="tabGraphs" class="side-body hidden">
+          <div class="side-toolbar">
+            <button id="btnGraphsClear" type="button" class="btn-muted btn-xs">清空</button>
+            <span class="muted">工具图 / MFA 调用图</span>
+          </div>
+          <div class="graph-mfa-form" id="graphMfaForm">
+            <div class="graph-mfa-row">
+              <input id="graphMfaModule" placeholder="模块 alAgent" value="alAgent" autocomplete="off">
+              <input id="graphMfaFunction" placeholder="函数 run" value="run" autocomplete="off">
+              <input id="graphMfaArity" placeholder="元数" value="2" title="arity" style="max-width:52px" autocomplete="off">
+            </div>
+            <div class="graph-mfa-row">
+              <select id="graphMfaDir" class="btn-muted btn-xs" title="双向=被调用+调用别人同图">
+                <option value="both">双向调用链</option>
+                <option value="callers">被谁调用</option>
+                <option value="callees">它调用谁</option>
+              </select>
+              <button type="button" class="btn-muted btn-xs" id="btnGraphMfaRun">生成调用图</button>
+              <span id="graphMfaStatus" class="muted side-note"></span>
+            </div>
+          </div>
+          <ul id="graphsList" class="side-list"></ul>
+          <div id="graphView" class="graph-view muted">暂无图表 — 上方输入 MFA 生成调用/被调用图，或运行 callGraph / moduleDeps 后会出现在这里</div>
+          <div id="graphDetail" class="graph-detail muted">选中图中节点后，这里显示模块 / 函数 / 元数 / 调用行 / 注解</div>
+        </div>
+        <div id="tabSessions" class="side-body hidden">
+          <h4 class="side-h">活跃会话</h4>
+          <ul id="activeSessionsList" class="side-list"></ul>
+          <h4 class="side-h">已保存</h4>
+          <ul id="savedSessionsList" class="side-list"></ul>
+        </div>
+        <div id="tabCheckpoints" class="side-body hidden">
+          <div class="side-toolbar">
+            <button id="btnCheckpointsRefresh" type="button" class="btn-muted btn-xs">刷新</button>
+            <span class="muted">中断/重启后可在此恢复</span>
+          </div>
+          <ul id="checkpointsList" class="side-list"></ul>
+        </div>
+        <div id="tabMetrics" class="side-body hidden"><div id="metricsBox"></div></div>
+        <div id="tabAudit" class="side-body hidden"><ul id="auditList" class="audit-list"></ul></div>
+        <div id="tabTools" class="side-body hidden"><ul id="toolsList"></ul></div>
+        <div id="tabTokens" class="side-body hidden"><div id="tokenBox"></div></div>
+        <div id="tabMemory" class="side-body hidden memory-pane">
+          <div class="side-toolbar mem-subtabs" id="dbTableTabs"></div>
+          <div class="side-toolbar mem-kind-row" id="memKindTabs"></div>
+          <div class="side-toolbar mem-search-row">
+            <input id="memQ" class="core-q" placeholder="搜索记忆/经验内容、标签、kind…" autocomplete="off">
+            <button type="button" class="btn-muted btn-xs" id="btnMemSearch">搜索</button>
+            <button type="button" class="btn-muted btn-xs" id="btnMemRefresh">刷新</button>
+          </div>
+          <div id="memMeta" class="muted side-note"></div>
+          <div id="memWhy" class="muted side-note mem-why">自动蒸馏与经验教训落在 .ali/db（memories）；此处可浏览与搜索。</div>
+          <div id="memList" class="mem-list muted">打开后加载记忆与经验</div>
+        </div>
+        <div id="tabKnowledge" class="side-body hidden knowledge-pane">
+          <div class="side-toolbar kn-subtabs">
+            <button type="button" class="btn-muted btn-xs kn-sub active" data-kn="overview">概览</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="search">搜索</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="map">模块</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="actions">动作</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="data">数据表</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="summaries">主题摘要</button>
+            <button type="button" class="btn-muted btn-xs kn-sub" data-kn="agent">提示词</button>
+          </div>
+          <div id="knForm" class="core-form"></div>
+          <div id="knMeta" class="muted side-note core-meta"></div>
+          <div id="knResult" class="kn-result">打开后可搜索 / 浏览 .ali/knowledge</div>
+        </div>
+        <div id="tabCore" class="side-body hidden core-pane">
+          <div class="side-toolbar core-subtabs">
+            <button type="button" class="btn-muted btn-xs core-sub active" data-core="status">状态</button>
+            <button type="button" class="btn-muted btn-xs core-sub" data-core="modules">模块</button>
+            <button type="button" class="btn-muted btn-xs core-sub" data-core="search">搜索</button>
+            <button type="button" class="btn-muted btn-xs core-sub" data-core="module">符号</button>
+            <button type="button" class="btn-muted btn-xs core-sub" data-core="callers">调用</button>
+          </div>
+          <div id="coreForm" class="core-form"></div>
+          <div id="coreMeta" class="muted side-note core-meta"></div>
+          <div id="coreResult" class="core-result">打开面板后点上方子按钮查询 aliCore 数据</div>
+        </div>
+      </aside>
+  </div><!-- .shell-main -->
+  </div><!-- .shell -->
   <!--ALI_WEB_CONFIG-->
-  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="/static/mermaid.min.js"></script>
   <script>if (window.mermaid) { mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'strict' }); }</script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=hl12"></script>
 </body>
 </html>

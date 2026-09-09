@@ -1,0 +1,350 @@
+[
+ {root, "."},
+ %% 运行时数据目录：默认启动 cwd 下的 .ali；可改前缀如 "xxx/.ali"
+ %% 嵌入其它项目时：数据写在「宿主启动目录」下，与 release 安装位置无关。
+ {dataDir, ".ali"},
+ %% 额外代码索引根目录（相对 root 或绝对路径）。
+ %% 索引时始终包含 agent.projectRoot；此处可追加：其它代码库、共享 deps、
+ %% 甚至 OTP 源码目录（如 "C:/Program Files/Erlang OTP/lib"）。
+ %% 示例：
+ %% {codeRoots, [
+ %%   "../shared_lib",
+ %%   "D:/otp/lib"
+ %% ]},
+ {codeRoots, []},
+ %% 严格配置校验：true 时若 llm.apiKey/baseUrl/model 缺失，load 返回
+ %% {error, {cfgMissing, _}} 而非 ok（默认 false 保持向后兼容）
+ {strictCfg, false},
+ {core, #{
+   enabled => true,
+   mode => port,
+   timeout => 30000,
+   indexTimeout => 600000,
+  %% 并发策略：普通用户一般无需改。推荐只配“策略”，不要直接写死数字。
+  %% auto 模式会根据 schedulers_online 自动推导：
+  %%   workerThreads / maxInflight / limitSearch / limitDb / ...
+  %% 这些推导值会继续注入 aliCore（ALI_CORE_LIMIT_*），因此运行时代码无需知道
+  %% 你是手工配数字还是策略驱动。
+  concurrency => #{
+    %% auto   ：按当前机器 schedulers_online 自动推导并发值（推荐默认）
+    %% manual ：保留/尊重外层显式填写的 maxInflight、limitSearch、workerThreads...
+    mode => auto,
+
+    %% conservative：更保守，少占资源，适合低配机/和其它服务共机
+    %% balanced    ：默认；延迟与吞吐折中
+    %% aggressive  ：更激进，提高搜索/图分析并发，适合高配专用机
+    profile => balanced,
+
+    %% latency    ：优先交互延迟，减少堆积，适合多人同时问答
+    %% balanced   ：默认；吞吐与延迟折中
+    %% throughput ：优先吞吐，总并发更高，适合后台批量任务更多的场景
+    target => balanced,
+
+    %% 给 BEAM/系统预留的调度器数量；auto 推导时会先从 schedulers_online
+    %% 扣掉这些，再决定 Rust workerThreads / inflight 上限。
+    %% 一般 1 就够；机器很弱或 Erlang 侧负载很重时可调到 2。
+    reserveSchedulers => 1,
+
+    %% 自动推导后的全局 inflight 硬上限。即使 profile/target 很激进，也不会
+    %% 超过这个值，防止极端情况下把内存/队列打爆。
+    hardMaxInflight => 64
+
+    %% workerThreads => 8,
+    %% 可选：显式覆盖 auto 推导出的 tokio worker 线程数。
+    %% 不填时由 auto 根据 schedulers_online + profile 推导。
+  },
+
+  %% 是否启用 Port 多 inflight：
+  %% true  = Erlang 侧允许多个请求同时在途，配合 seq 匹配乱序回包（推荐）
+  %% false = 回退到旧的“单请求闸门”模式，仅用于排障/兼容
+  multiInflight => true,
+
+  %% 索引是否允许后台异步执行：
+  %% true  = /index 很快返回，索引在后台跑；更适合 Web 多客户端
+  %% false = /index 同步执行，调用方阻塞到索引完成
+   indexAsync => true,
+   %% 启动后后台索引全部 codeRoots（ali:start 默认不阻塞等待）
+   indexBackground => true,
+   hybridCandidateScan => true,
+   %% 可执行文件仅写文件名，运行时经 code:priv_dir(ali) 定位
+   binary => "aliCore",
+   args => ["--port"],
+   dbPath => "db/ali.db",
+   dbSchema => "db/schema.sql",
+   indexDir => "index/tantivy",
+   %% 索引/Web 文件树/文本搜索默认忽略（权威；port 启动注入 ALI_INDEX_IGNORE）
+   %% pb / *_pb.erl：协议生成文件常达数 MB，tree-sitter 解析极慢，默认跳过
+   indexIgnore => "_build,deps,.git,.svn,target,.ali,log,logs,ebin,node_modules,.idea,.cursor,.vscode,priv/index,erl_crash.dump,rebar3.crashdump,pb,*_pb.erl",
+   indexExtensions => "erl,hrl",
+   %% undefined = 用机器逻辑核数
+   indexThreads => undefined,
+   %% 单文件解析超时（秒）；超时打印并跳过。0 = 不限制
+   indexFileTimeoutSecs => 30
+ }},
+ {textSearch, #{
+   backend => rg,
+   timeoutMs => 8000,
+   %% undefined = 复用 core.indexIgnore
+   ignore => undefined
+ }},
+ %% LLM 工具 webSearch / webQa 的搜索后端配置
+ {webSearch, #{
+   enabled => true,
+   %% auto | duckduckgo | duckduckgo_html | wikipedia | bing
+   %% auto：DuckDuckGo Instant Answer → DDG HTML → [Bing] → Wikipedia 逐级回退
+   %% 配置了 bingApiKey 时在 Wikipedia 前插入 Bing；国内 DDG 不稳定时可配 Bing 作保底
+   engine => auto,
+   maxResults => 5,
+   timeoutMs => 10000,
+   %% Wikipedia 语言代码
+   language => <<"zh">>,
+   %% engine=bing 时必填；auto 链有 key 时也会启用 Bing 回退
+   bingApiKey => undefined,
+   %% bingApiKey => "${ENV:ALI_BING_API_KEY}",
+   %% 同引擎两次请求最小间隔 ms（防 DuckDuckGo 封禁；0=不限）
+   minIntervalMs => 1100,
+   %% 相同 query/engine/limit/offset/freshness 的结果缓存 TTL ms（0=关闭）
+   cacheTtlMs => 300000
+ }},
+ %% LLM 工具 fetchUrl / fetchUrlPage 的网页抓取配置
+ {fetchUrl, #{
+   %% true = 允许抓取内网地址（默认 false，SSRF 防护）
+   allowInternal => false,
+   %% 同域名两次请求最小间隔 ms（0=不限）
+   perHostMinIntervalMs => 1000,
+   %% 自定义 User-Agent（默认类 Chrome UA）
+   userAgent => undefined,
+   %% 抓取成功后把网页正文存入长期记忆（kind=webPage，project 范围）
+   rememberWebPages => true
+ }},
+ %% Web UI 与 Gateway API 共用一个 HTTP 监听端口。
+ %% web.enabled 或 gateway.enabled 任一为 true 即启动；优先使用 web.port。
+ {gateway, #{
+   enabled => true,
+   port => 8787,
+   authToken => undefined
+ }},
+ {web, #{
+   enabled => true,
+   port => 8787,
+   %% 监听绑定地址：默认仅绑本机回环 127.0.0.1；如需对外暴露改为 "0.0.0.0"
+   %% 或具体网卡地址，并务必配置 apiToken 与 allowOrigin 白名单。
+   bindAddress => "127.0.0.1",
+   allowOrigin => undefined,
+   apiToken => undefined,
+   rateLimit => 480,
+   rateWindowMs => 60000,
+   %% 单次请求/WS 帧最大字节数上限（默认 16MB），防超大请求 DoS。
+   maxRequestBytes => 16777216,
+   allowRemoteWrites => false
+ }},
+ {llm, #{
+   %% LLM 只配 chain：至少一项有效（baseUrl+model）；空 chain = LLM 不可用。
+   %% 三种常见形态：
+   %%   1) local + cloud — 本地先试，答不好/失败自动升云（推荐）
+   %%   2) 仅 local     — 只走本地，无升云
+   %%   3) 仅 cloud     — 始终云端，无本地
+   routing => #{enabled => true, ttlDays => 30, criticThreshold => 0.5},
+   %% HTTP 传输（eWCli）：连接池 + ALPN(h2) + protocol。
+   %% protocol=tcp：不自动升 HTTP/3（避免 QUIC 不通刷 CRASH / 拖慢）。
+   %% 需要 H3：protocol => auto；排障：usePool/alpn => false
+   http => #{usePool => true, alpn => true, protocol => tcp},
+   %% vision（推荐按链项显式配，不按厂商猜）：
+   %%   true  强制发图；false 强制降级；auto 本地探测 + 模型名启发式
+   %% DeepSeek 视觉型号示例：model => "deepseek-v4-flash-vision-exp", vision => true
+   %% 普通文本型号：vision => false 或省略（auto 名不含 vision/-vl 则不发图）
+   chain => [
+     #{id => local, provider => llamaCpp,
+       baseUrl => "http://127.0.0.1:8080/v1",
+       model => "qwen2.5:7b",
+       apiKey => "none",
+       priority => 1, roles => [main, aux],
+       maxRetries => 1, execTimeout => 120000,
+       thinking => disabled, vision => auto},
+     #{id => cloud, provider => deepseek,
+       baseUrl => "https://api.deepseek.com",
+       model => "deepseek-v4-flash",
+       apiKey => "${ENV:ALI_LLM_API_KEY}",
+       priority => 2, roles => [main, critic],
+       maxRetries => 3, execTimeout => 180000,
+       %% thinkingBudget（可选，仅智谱 GLM 系生效）：low|high|max 控制思考
+       %% 深度。始终思考模型（如 glm-5.3-flash）不支持 disabled，复审等
+       %% 同步调用默认 budget=low 提速；配置此项可覆盖（none=不带 budget）。
+       thinking => enabled, thinkingBudget => undefined, vision => false}
+   ]
+   %% 仅云端示例（注释 local，只留一项）：
+   %% chain => [
+   %%   #{id => cloud, provider => deepseek,
+   %%     baseUrl => "https://api.deepseek.com",
+   %%     model => "deepseek-v4-flash",
+   %%     apiKey => "${ENV:ALI_LLM_API_KEY}",
+   %%     priority => 1, roles => [main, aux, critic],
+   %%     maxRetries => 3, execTimeout => 180000, thinking => disabled}
+   %% ]
+}},
+ %% 未启用 chain 时的主备兜底（fallbackModel / fallbackProvider 等）见 README。
+ %% Web「自定义 LLM」下拉：默认读 priv/catalog/llm_providers.json，不在前端/Handler 写死。
+ %% 可选覆盖：
+ %% {llmCatalog, #{
+ %%   file => "catalog/llm_providers.json",
+ %%   exclude => [oneapi],
+ %%   providers => #{
+ %%     deepseek => #{models => ["deepseek-v4-pro", "deepseek-v4-flash"]}
+ %%   }
+ %% }},
+ %% 向量检索 / 重排：完全由本段配置决定（enabled + baseUrl + apiKey + model 四项齐才启用）。
+ %% DeepSeek 等对话 API 无 /v1/embeddings —— apiKey=inherit 无效，须另配本地 llama-server 或云 embed。
+ %% 本地 Qwen3 示例见 README「本地语义检索」与 priv/docs/local-semantic-search.md
+ %%   enabled => true,
+ %%   apiKey => <<"local">>,
+ %%   baseUrl => "http://127.0.0.1:8081/v1/embeddings",
+ %%   model => "Qwen3-Embedding-4B"
+ {embedding, #{
+   enabled => false,
+   apiKey => inherit,
+   baseUrl => undefined,
+   model => undefined
+ }},
+ {qdrant, #{
+   enabled => false,
+   binary => "qdrant",
+   httpPort => 6333,
+   grpcPort => 6334,
+   storagePath => "qdrant/storage"
+ }},
+ %% 显式设置则连接外部 Qdrant，不自动拉起 priv/qdrant
+ {qdrantUrl, undefined},
+ %% Rerank：Cohere 兼容 /v1/rerank；未启用时 hybrid 结果不重排。
+ %% 本地 Qwen3-Reranker-4B 示例（须用 llama.cpp 官方脚本转换的 GGUF）：
+ %%   enabled => true,
+ %%   apiKey => <<"local">>,
+ %%   baseUrl => "http://127.0.0.1:8081/v1/rerank",
+ %%   model => "Qwen3-Reranker-4B"
+ {rerank, #{
+   enabled => false,
+   apiKey => inherit,
+   baseUrl => undefined,
+   model => undefined
+ }},
+ {agent, #{
+   mode => ask,
+   maxSteps => 50,
+   %% 整轮问答超时（毫秒）：session worker + 交互 ali:chat() 共用
+   agentTimeoutMs => 600000,
+   maxMessages => 50,
+   maxContextChars => 120000,
+   %% 工具结果超此字节数时自动 limit/2 重试；0 关闭
+   maxToolContentBytes => 16384,
+   historyCompaction => true,
+   %% 0=关闭复审；>0=同步复审后再把该答案展示给用户（不要后台另审一份）
+   %% 答案复审：0=关；1=云 critic 快速审（推荐 local+cloud 链）；3=多轮修订
+   maxCriticRounds => 1,
+   skillsEnabled => true,
+   skillsDir => "skills",
+   maxActiveSkills => 3,
+   personasEnabled => true,
+   personasDir => "personas",
+   defaultPersona => erlang_expert,
+   personasAutoMatch => true,
+   experienceEnabled => true,
+   autoRecordLessons => true,
+   autoExtractTurnKnowledge => true,
+   autoExtractTurnLlm => true,
+   experienceRecallLimit => 5,
+   experienceUnifiedRecall => true,
+   systemPromptExtra => <<>>,
+   %% 主工程代码根：相对启动 root，或绝对路径。启动目录 ≠ 代码目录时改这里。
+   %% 主工程代码根：嵌入宿主时请改为宿主源码绝对路径（启动目录常 ≠ 代码目录）。
+   %% 主工程代码根（相对顶层 root，或绝对路径）。
+   %% Web「文件」树 / 只读浏览 / 代码索引主根均对齐本项。
+   projectRoot => ".",
+   %% /index 成功后是否自动刷新 .ali/knowledge（含 agent.json 软合并）
+   digestAfterIndex => true,
+   %% 首次启动若尚无 knowledge：等索引就绪后自动构建
+   digestOnStartup => true,
+   %% 每次启动都强制刷新 knowledge（默认 false，仅缺库时自动建）
+   digestRefreshOnStartup => false,
+   autoDistillMemories => true,
+   memoryDistillModel => undefined,
+   toolCacheEnabled => true,
+   toolCacheTtl => 300000,
+   toolCacheMaxSize => 512,
+   backupBeforeEdit => true,
+   backupDir => "backups",
+   policy => #{
+     allowRead => true,
+     allowExecuteSafe => true,
+     %% 对话/网页可 runMfa 查/改业务数据；仅 runMfaBlacklist 拦截
+     allowExecuteRisky => true,
+     allowWrite => false,
+     %% 网页审批已关掉：写类工具（含 runMfa 写意图）直接执行，不再弹确认条
+     requireConfirmationWrite => false,
+     requireConfirmationRisky => false
+   }
+ }},
+ {mcpServers, []},
+ %% MCP tools/call 默认模式：ask | edit | exec（也可在 params.mode / _meta.mode 覆盖）
+ {mcp, #{defaultMode => ask}},
+ {patch, #{
+   allowedRoots => ["src", "config", "priv"],
+   requireDryRun => false,
+   %% 写文件后自动跑 rebar3 compile 验证；失败则本次事务回滚
+   verifyCompileAfterPatch => true,
+   %% 验证命令模板；可用 %{root} 占位项目根
+   compileCommand => "rebar3 compile",
+   compileTimeoutMs => 120000
+ }},
+ {db, #{
+   enabled => true,
+   backend => local,
+   engine => sqlite,
+   path => "db/ali.db",
+   schema => "db/schema.sql",
+   allowWrite => true
+ }},
+ {limits, #{
+   maxToolContent => 262144,
+   toolReadFileMaxBytes => 1048576,
+   webMaxImages => 24,
+   webMaxImageBytes => 4194304,
+   webMaxFiles => 12,
+   webMaxFileBytes => 524288,
+   webMaxDocuments => 4,
+   webMaxDocumentBytes => 10485760
+ }},
+ %% runMfa：blacklist=开发默认；whitelist=生产推荐
+ {runMfaPolicy, blacklist},
+ %% evalErl：节点内校验后执行表达式/匿名 fun；远程 MFA 复用上方 runMfa 策略。
+ %% false 可整体关闭该工具。
+ {evalErlEnabled, true},
+ %% false=写活数据不强制 verifyRead（有则仍做 before/after 快照）
+ {runMfaRequireVerifyRead, false},
+ %% blacklist：已导出 MFA 默认可跑；仅拒绝下方危险原语。
+ {runMfaBlacklist, [
+   {os, cmd},
+   {os, putenv},
+   {erlang, halt},
+   {erlang, open_port},
+   {init, stop},
+   {init, reboot},
+   {file, write_file},
+   {file, delete},
+   {code, purge},
+   {code, load_binary},
+   {rpc, call},
+   {erpc, call}
+ ]},
+ %% 其它策略可选：whitelist | allowModules | allowExported
+ {runMfaAllowModules, []},
+ %% call=rid("YY1") 未写模块时的默认模块（如 player）
+ {runMfaDefaultModule, undefined},
+ %% JSON 字符串参数风格：list（Erlang 字符串）| binary | asIs
+ {runMfaArgStyle, list},
+ %% 仅当 runMfaPolicy=whitelist 时使用
+ {runMfaWhitelist, [
+   {erlang, system_info, 1},
+   {erlang, memory, 0},
+   {erlang, processes, 0}
+ ]},
+ {etsBlockedNames, [ali_patch_transactions, ssl_pem_cache, oauth_cache]}
+].

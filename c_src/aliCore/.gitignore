@@ -1,0 +1,9 @@
+# Cargo build output
+/target/
+/target_run/
+**/*.rs.bk
+*.pdb
+
+# Local binaries accidentally placed here
+/aliCore
+/aliCore.exe

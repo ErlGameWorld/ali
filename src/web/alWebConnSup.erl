@@ -1,10 +1,11 @@
 %%%-------------------------------------------------------------------
-%%% @doc Web HTTP/WebSocket 连接监督者。
-%%%
-%%% eWSrv 在 `wsSupName` 指定本监督者时，每个 TCP 连接以
-%%% {@link wsHttp} worker 动态挂在其下（`simple_one_for_one`）。
-%%% @end
+%% @doc HTTP/WebSocket 连接 supervisor。
+%%
+%% eWSrv 通过 wsSupName 选项使用本 supervisor，为每个入站 TCP 连接
+%% 派生一个 wsHttp worker。worker 为 temporary——退出后不重启。
+%% @end
 %%%-------------------------------------------------------------------
+
 -module(alWebConnSup).
 
 -behaviour(supervisor).
@@ -13,13 +14,27 @@
 
 -define(SERVER, ?MODULE).
 
-%% @doc 启动连接监督者，注册名为 `alWebConnSup`。
--spec start_link() -> {ok, pid()} | {error, term()}.
+%%--------------------------------------------------------------------
+%% @doc
+%% 创建并链接 HTTP/WebSocket 连接 supervisor，注册为本地名 ?SERVER。
+%%
+%% @return {ok, Pid} | {error, Reason}
+%% @end
+%%--------------------------------------------------------------------
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc 初始化 `simple_one_for_one` 监督树，子进程模板为 wsHttp。
--spec init([]) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+%%--------------------------------------------------------------------
+%% @doc
+%% supervisor 初始化回调：使用 simple_one_for_one 策略，为每个
+%% 接入的 TCP 连接动态启动一个 wsHttp worker。worker 为 temporary
+%% 类型，退出后不重启；intensity=100/period=3600 防止连接风暴时
+%% 触发 supervisor 自身终止。
+%%
+%% @param [] 初始参数（空）
+%% @return {ok, {SupFlags, ChildSpecs}}
+%% @end
+%%--------------------------------------------------------------------
 init([]) ->
     SupFlags = #{
         strategy => simple_one_for_one,
