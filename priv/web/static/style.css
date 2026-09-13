@@ -547,12 +547,15 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 }
 .thinking-reasoning {
   margin: 6px 0 8px 0;
+  padding: 6px 8px;
   max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
   color: #8b949e;
   border-left: 2px solid #30363d;
 }
-/* 思考正文只走下方输出气泡；隐藏误挂在工具框顶部的独立推理区 / 旧版正文块 */
-.msg.thinking > pre.thinking-reasoning,
+/* 旧会话的 thought li 已由统一 capture 代替，避免重复。 */
 .thinking-log > li.thinking-thought {
   display: none !important;
 }

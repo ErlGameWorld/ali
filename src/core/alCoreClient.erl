@@ -218,7 +218,12 @@ indexAsync(Path) ->
     indexAsync(Path, #{}).
 
 indexAsync(Path, Opts) when is_map(Opts) ->
-    spawn(fun() -> index(Path, Opts) end),
+    _ = alAsync:run(coreIndex, fun() ->
+        case index(Path, Opts) of
+            {ok, _} -> ok;
+            {error, Reason} -> logger:warning("aliCore async index failed: ~p", [Reason])
+        end
+    end),
     {ok, indexing}.
 
 %%--------------------------------------------------------------------
@@ -233,7 +238,7 @@ indexAsyncRoots(Roots) when is_list(Roots) ->
     indexAsyncRoots(Roots, #{}).
 
 indexAsyncRoots(Roots, Opts) when is_list(Roots), is_map(Opts) ->
-    spawn(fun() ->
+    _ = alAsync:run(coreIndexRoots, fun() ->
         lists:foreach(
             fun(Root) ->
                 case index(Root, Opts) of
@@ -1037,7 +1042,7 @@ handle_info(eReconnectPort, State = #{enabled := true, port := undefined}) ->
         {ok, Port} ->
             application:set_env(ali, coreAvailable, true),
             Parent = self(),
-            spawn(fun() ->
+            _ = alAsync:run(coreStartupSnapshot, fun() ->
                 case collectStartupSnapshot(3) of
                     {ok, Snapshot} ->
                         Parent ! {eHealthSnapshot, Snapshot};

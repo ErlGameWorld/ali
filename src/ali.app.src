@@ -73,6 +73,7 @@
         alCfg,
         alArchive,
         alArchiver,
+        alAsync,
         alAppTopology,
         alGitIndex,
         alSpecIndex,

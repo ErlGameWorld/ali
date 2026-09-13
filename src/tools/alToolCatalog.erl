@@ -1052,10 +1052,10 @@ usefulLlmDesc(_) -> true.
 
 llmDescHasHint(Desc) ->
     Hints = [
-        <<"默认"/utf8>>, <<"勿"/utf8>>, <<"禁止"/utf8>>, <<"简写"/utf8>>,
+        <<"勿"/utf8>>, <<"禁止"/utf8>>, <<"简写"/utf8>>,
         <<"别名"/utf8>>, <<"|">>, <<"危险"/utf8>>, <<"1-based">>,
         <<"read="/utf8>>, <<"write="/utf8>>, <<"仅"/utf8>>,
-        <<"非"/utf8>>, <<"上限"/utf8>>, <<"必须"/utf8>>, <<"可选"/utf8>>,
+        <<"非"/utf8>>, <<"上限"/utf8>>, <<"必须"/utf8>>,
         <<"auto">>, <<"null">>, <<"nextCursor">>, <<"HEAD">>
     ],
     lists:any(fun(H) -> binary:match(Desc, H) =/= nomatch end, Hints).

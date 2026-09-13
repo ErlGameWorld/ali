@@ -40,7 +40,8 @@
          isWriteToolCall/1,
          executeToolCalls/2,
          collectToolResults/3,
-         prefetchTargets/1]).
+         prefetchTargets/1,
+         toolDefinitions/1]).
 -endif.
 
 -define(DefaultMaxToolSteps, 50).
@@ -438,7 +439,8 @@ runWithToolsSessionLlm(Question, Opts, SessionId) ->
     end,
     %% 投机预取（P2-9）：上下文侦察出的高概率文件异步预热工具缓存，
     %% LLM 首轮 readFile 直接命中。投机性质：未命中无害，TTL 自动清理。
-    _ = spawn(fun() -> speculativePrefetch(Context) end),
+    _ = alAsync:run(speculativePrefetch,
+                    fun() -> speculativePrefetch(Context) end),
     toolLoop(Messages0, Opts2, Context, 0, [], MaxSteps).
 
 %%--------------------------------------------------------------------
@@ -774,7 +776,8 @@ toolLoopStep(BoundedMessages, LlmOpts0, Opts, Context, Step, Trace, MaxSteps) ->
     Parent = self(),
     emitProgress(Opts, #{type => step, phase => llmConnect, step => Step,
                          message => <<"正在请求模型…"/utf8>>}),
-    Ticker = spawn(fun() -> llmWaitTicker(Parent, Opts, Step, 0) end),
+    Ticker = alAsync:run(llmWaitTicker,
+                         fun() -> llmWaitTicker(Parent, Opts, Step, 0) end),
     LlmResult0 = try
         case is_pid(StreamCaller) of
             true ->
@@ -804,16 +807,18 @@ toolLoopStep(BoundedMessages, LlmOpts0, Opts, Context, Step, Trace, MaxSteps) ->
                 undefined -> AssistantMsg1;
                 RC -> AssistantMsg1#{reasoning_content => RC}
             end,
-            %% ReAct: 把 LLM 的思考内容作为 thought 进度推送，让用户看到推理过程。
-            case maps:get(content, AssistantMessage, <<>>) of
-                Thought when is_binary(Thought), Thought =/= <<>> ->
+            %% ReAct: 优先推送真正的 reasoning_content。旧逻辑优先 content，
+            %% thinking 模型同时返回两者时，前端实时 reasoning 与结束后的
+            %% thought 快照来自两个字段，造成“思考过程前后不一致”。
+            case maps:get(reasoning_content, AssistantMessage, <<>>) of
+                RThought when is_binary(RThought), RThought =/= <<>> ->
                     emitProgress(Opts, #{type => thought, phase => reasoning,
-                                         step => Step, message => Thought});
+                                         step => Step, message => RThought});
                 _ ->
-                    case maps:get(reasoning_content, AssistantMessage, <<>>) of
-                        RThought when is_binary(RThought), RThought =/= <<>> ->
+                    case maps:get(content, AssistantMessage, <<>>) of
+                        Thought when is_binary(Thought), Thought =/= <<>> ->
                             emitProgress(Opts, #{type => thought, phase => reasoning,
-                                                 step => Step, message => RThought});
+                                                 step => Step, message => Thought});
                         _ -> ok
                     end
             end,
@@ -1411,16 +1416,33 @@ isRuntimeQuestion(Q0) ->
             false;
         false ->
             Q = string:lowercase(unicode:characters_to_list(to_binary(Q0))),
-            %% 仅保留跨项目通用信号；业务实体来自 `.ali/knowledge/agent.json`。
-            GenericEntity = ["ets", "进程", "process", "mailbox"],
-            GenericOp = ["执行函数", "执行一下", "跑一下", "调用一下", "执行 ", "runmfa"],
+            %% 运行时分类必须同时具备「运行时实体 + 观测意图」。过去这里用
+            %% HasEntity orelse HasOp，导致普通的 process/state 解释题、甚至只含
+            %% “执行”二字的问答也被强制补一次 getRuntime。
+            %% 显式 MFA 执行和明确快照问句仍由下面两个 parser 独立直达。
+            GenericEntity = [
+                "ets", "进程", "process", "processes", "mailbox", "pid", "supervisor",
+                "内存", "memory", "节点", "node", "scheduler", "heap",
+                "runqueue", "run_queue", "消息队列", "message_queue"
+            ],
+            ObserveOp = [
+                "当前", "现在", "查看", "查一下", "状态", "占用", "最高",
+                "最大", "列表", "多少", "泄漏", "卡住", "运行中", "快照",
+                "current", "show", "list", "status", "state", "usage", "top",
+                "running", "snapshot", "inspect", "dump"
+            ],
             ProjectEntity = safeProjectKeywords(fun alProjectDigest:liveDataKeywords/0),
             ProjectOp = safeProjectKeywords(fun alProjectDigest:liveDataOpKeywords/0),
-            HasEntity = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
-                                  GenericEntity ++ ProjectEntity),
-            HasOp = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
-                              GenericOp ++ ProjectOp),
-            HasEntity orelse HasOp
+            HasGenericEntity = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
+                                         GenericEntity),
+            HasProjectEntity = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
+                                         ProjectEntity),
+            HasObserveOp = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
+                                     ObserveOp),
+            HasProjectOp = lists:any(fun(K) -> matchHintKeyword(Q, K) end,
+                                     ProjectOp),
+            (HasGenericEntity andalso HasObserveOp)
+                orelse (HasProjectEntity andalso (HasObserveOp orelse HasProjectOp))
                 orelse parseDirectExecCall(Q0) =/= error
                 orelse parseDirectRuntimeProbe(Q0) =/= error
     end.
@@ -3914,10 +3936,25 @@ searchToInt(_, Default) -> Default.
 toolDefinitions(Opts) ->
     Mode = maps:get(mode, Opts, ask),
     Allow = maps:get(toolsAllowlist, Opts, all),
-    Defs = [Def || Def <- alToolCatalog:definitionsForMode(Mode),
+    Defs0 = [Def || Def <- alToolCatalog:definitionsForMode(Mode),
             modeAllowsTool(Def, Mode),
             allowlistAllows(Def, Allow)],
+    %% 运行时工具具有很强的“行动诱惑”：普通代码/知识问答也可能被模型误选，
+    %% 随后整个流程被实时快照带偏。只有统一分类器确认是运行时观测问题时
+    %% 才下发这些定义；callTool API 本身不受影响。
+    Defs = filterRuntimeToolDefinitions(Defs0,
+        maps:get(currentQuestion, Opts, <<>>)),
     sortToolsByPreferred(Defs, maps:get(preferredTools, Opts, [])).
+
+filterRuntimeToolDefinitions(Defs, Question) ->
+    case isRuntimeQuestion(Question) of
+        true -> Defs;
+        false ->
+            RuntimeOnly = [getRuntime, supervisorTree, getProcesses, processInfo,
+                           getOldCodeProcesses, etsLookup, getEts, appTopology],
+            [D || D <- Defs,
+                  not lists:member(toolDefAtom(D), RuntimeOnly)]
+    end.
 
 preferredToolsForQuestion(Question, Opts) ->
     Learn = try alToolLearn:suggestTools(Question, 5) catch _:_ -> [] end,
@@ -4126,20 +4163,17 @@ dispatchTool(indexCode, Args, _Opts) when is_map(Args) ->
     end,
     case alCoreClient:index(Path, IndexOpts) of
         {ok, _} = Ok ->
-            _ = spawn(fun() ->
-                try
-                    Recent = try alVcsIndex:recentFiles() catch _:_ -> [] end,
-                    Paths = case is_list(Recent) of
-                        true -> Recent;
-                        false ->
-                            try ordsets:to_list(Recent) catch _:_ -> [] end
-                    end,
-                    _ = alExperience:reconcileAfterCodeChange(#{
-                        changed => Paths,
-                        deleted => []
-                    })
-                catch _:_ -> ok
-                end
+            _ = alAsync:run(reconcileAfterIndex, fun() ->
+                Recent = try alVcsIndex:recentFiles() catch _:_ -> [] end,
+                Paths = case is_list(Recent) of
+                    true -> Recent;
+                    false ->
+                        try ordsets:to_list(Recent) catch _:_ -> [] end
+                end,
+                alExperience:reconcileAfterCodeChange(#{
+                    changed => Paths,
+                    deleted => []
+                })
             end),
             _ = alProjectDigest:maybeBuildAfterIndex(),
             Ok;
@@ -4516,11 +4550,8 @@ dispatchTool(vcsIndex, Args, _Opts) ->
     end,
     case alVcsIndex:incrementalIndex(Root) of
         {ok, Result} = Ok ->
-            _ = spawn(fun() ->
-                try alExperience:reconcileAfterCodeChange(Result)
-                catch _:_ -> ok
-                end
-            end),
+            _ = alAsync:run(reconcileAfterVcsIndex,
+                fun() -> alExperience:reconcileAfterCodeChange(Result) end),
             Ok;
         Error ->
             Error
@@ -4798,13 +4829,12 @@ maybeRememberWebPage(Result, Opts) ->
                 Title = maps:get(title, Result, <<>>),
                 Host = urlHostOf(Url),
                 Content = webPageMemoryContent(Title, Url, Body),
-                spawn(fun() ->
-                    try alMemory:remember(SessionId, webPage, Content,
-                                          #{scope => project,
-                                            tags => [webPage, Host],
-                                            metadata => #{url => Url,
-                                                          title => Title}})
-                    catch _:_ -> ok end
+                alAsync:run(rememberWebPage, fun() ->
+                    alMemory:remember(SessionId, webPage, Content,
+                                      #{scope => project,
+                                        tags => [webPage, Host],
+                                        metadata => #{url => Url,
+                                                      title => Title}})
                 end);
             false ->
                 ok
@@ -5093,11 +5123,8 @@ maybeReconcileAfterWrite(Result) ->
         [] ->
             ok;
         Paths ->
-            _ = spawn(fun() ->
-                try
-                    _ = alExperience:reconcileAfterCodeChange(#{changed => Paths, deleted => []})
-                catch _:_ -> ok
-                end
+            _ = alAsync:run(reconcileAfterWrite, fun() ->
+                alExperience:reconcileAfterCodeChange(#{changed => Paths, deleted => []})
             end),
             maybeBuildDigestThrottled(),
             ok

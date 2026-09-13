@@ -86,6 +86,47 @@ session_insert_or_ignore_via_execute_test() ->
     alFileDb:execute("DELETE FROM sessions WHERE id = ?", [Sid]),
     ok.
 
+%% 回归：session_artifacts upsert 必须走「按会话分片」写入，不得再
+%% 整文件读取 + tmp 重写（旧实现是 agent 收尾超时崩溃的根因）。
+%% 断言：多次 upsert 后查询只返回最新一行，且写入耗时不随文件增长。
+sessionArtifactUpsertIsShardScoped_test() ->
+    Sid = iolist_to_binary([<<"art_">>, integer_to_binary(erlang:unique_integer([positive]))]),
+    Sql = "INSERT OR REPLACE INTO session_artifacts "
+          "(session_id, summary, tool_trace, critiques, token_usage, plan, updated_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    try
+        %% 连续写 20 次，模拟多轮问答收尾
+        lists:foreach(fun(N) ->
+            ?assertMatch({ok, _},
+                alFileDb:execute(Sql, [Sid, <<"{\"n\":", (integer_to_binary(N))/binary, "}">>,
+                                       <<"[]">>, <<"[]">>, <<"{}">>, <<"{}">>, N]))
+        end, lists:seq(1, 20)),
+        %% 读回：同一 sessionId 只有一行，且为最后一次写入
+        {ok, Rows} = alFileDb:query(
+            "SELECT summary FROM session_artifacts WHERE session_id = ?", [Sid]),
+        ?assertEqual(1, length(Rows)),
+        [Row] = Rows,
+        Summary = maps:get(summary, Row, maps:get(<<"summary">>, Row, undefined)),
+        ?assertEqual(<<"{\"n\":20}">>, Summary)
+    after
+        alFileDb:execute("DELETE FROM session_artifacts WHERE session_id = ?", [Sid])
+    end.
+
+%% 回归：删除 artifacts 后查询应为空（分片删除生效）。
+sessionArtifactDelete_test() ->
+    Sid = iolist_to_binary([<<"artdel_">>, integer_to_binary(erlang:unique_integer([positive]))]),
+    Sql = "INSERT OR REPLACE INTO session_artifacts "
+          "(session_id, summary, tool_trace, critiques, token_usage, plan, updated_at) "
+          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ?assertMatch({ok, _},
+        alFileDb:execute(Sql, [Sid, <<"{}">>, <<"[]">>, <<"[]">>, <<"{}">>, <<"{}">>, 1])),
+    {ok, [_]} = alFileDb:query(
+        "SELECT summary FROM session_artifacts WHERE session_id = ?", [Sid]),
+    alFileDb:execute("DELETE FROM session_artifacts WHERE session_id = ?", [Sid]),
+    {ok, Rows} = alFileDb:query(
+        "SELECT summary FROM session_artifacts WHERE session_id = ?", [Sid]),
+    ?assertEqual([], Rows).
+
 %% 1a：filterMemoriesLike 支持 searchTags 风格的 2 元素参数 [Pattern, Limit]
 
 filterMemoriesLikeTwoParams_test() ->

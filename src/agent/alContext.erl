@@ -224,7 +224,13 @@ activeSkills(Question, Opts) when is_map(Opts) ->
     catch
         _:_ -> []
     end,
-    Matched = alSkill:match(Q, #{paths => Paths}),
+    Matched0 = alSkill:match(Q, #{paths => Paths}),
+    %% runtime-inspect 的提示会强烈要求先调 getRuntime。只有统一运行时
+    %% 分类器确认是活状态观测时才允许注入，防止 process/state 概念题走偏。
+    Matched = case alToolRouter:isRuntimeQuestion(Q) of
+        true -> Matched0;
+        false -> [N || N <- Matched0, not isRuntimeInspectSkill(N)]
+    end,
     case Matched of
         [_ | _] ->
             Matched;
@@ -240,6 +246,10 @@ activeSkills(Question, Opts) when is_map(Opts) ->
     end;
 activeSkills(Question, _) ->
     activeSkills(Question, #{}).
+
+isRuntimeInspectSkill(Name) ->
+    N = string:lowercase(toBinary(Name)),
+    N =:= <<"runtime-inspect">> orelse N =:= <<"runtime_inspect">>.
 
 %%--------------------------------------------------------------------
 %% @doc

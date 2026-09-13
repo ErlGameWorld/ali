@@ -61,6 +61,11 @@ ensureAll() ->
     _ = ensureNamedCache(alQueryDecomposeCache),
     _ = ensureNamedCache(alModuleSummaryCache),
     _ = ensureNamedCache(alGitRecentCache),
+    %% 工具学习 / 语义缓存：历史上同样是「首次调用者建表」，若首个建表者
+    %% 是短命 agent worker，表会随其退出而销毁，导致学习到的工具模式与
+    %% 语义缓存静默丢失（下次还得重新学/重新算）。此处统一纳管。
+    _ = alToolLearn:ensureStarted(),
+    _ = alSemanticCache:ensureStarted(),
     ok.
 
 ensureNamedCache(Table) ->
@@ -90,7 +95,8 @@ tables() ->
     [alPlan, alTokenStats, ali_patch_transactions, alAudit,
      alMetrics, ali_tool_metrics, ali_metrics_latency, alProgress, alTasks,
      alToolCache,
-     alQueryRewriteCache, alQueryDecomposeCache, alModuleSummaryCache, alGitRecentCache].
+     alQueryRewriteCache, alQueryDecomposeCache, alModuleSummaryCache, alGitRecentCache,
+     ali_tool_patterns, ali_semantic_cache].
 
 %%--------------------------------------------------------------------
 %% @doc

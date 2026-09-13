@@ -114,11 +114,9 @@ handle_info(scan, State) ->
             %% 文件变更：清 ETS + SQLite，避免 stale 摘要回填
             try alModuleSummary:invalidateAll() catch _:_ -> ok end,
             %% 轻量重建 Project Digest（不阻塞监听循环）
-            spawn(fun() ->
-                try
-                    %% 与全量 digest 共用 defaultOpts，避免轻量/全量双轨漂移
-                    alProjectDigest:build(#{})
-                catch _:_ -> ok end
+            _ = alAsync:run(fileWatcherDigestBuild, fun() ->
+                %% 与全量 digest 共用 defaultOpts，避免轻量/全量双轨漂移
+                alProjectDigest:build(#{})
             end)
     end,
     erlang:send_after(State#state.intervalMs, self(), scan),

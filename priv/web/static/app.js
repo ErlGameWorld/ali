@@ -3562,6 +3562,7 @@ function startThinking(question) {
   thinkingBox.innerHTML =
     '<div class="thinking-title">思考中...</div>'
     + '<div class="thinking-status">正在连接...</div>'
+    + '<pre class="thinking-reasoning"></pre>'
     + '<ul class="thinking-log"></ul>'
     + '<div class="thinking-capture" hidden aria-hidden="true">'
     +   '<pre class="thinking-capture-question"></pre>'
@@ -3625,6 +3626,10 @@ function renderThoughtCapture() {
   if (thoughtCapture && thoughtCapture.pre) {
     thoughtCapture.pre.textContent = thoughtCapture.text;
   }
+  // 进行中的可见思考与右下角查看器共用同一份 capture，
+  // 不再把 reasoning 混入最终答案气泡。
+  const live = thinkingBox ? thinkingBox.querySelector('.thinking-reasoning') : null;
+  if (live) live.textContent = thoughtCapture ? thoughtCapture.text : '';
 }
 
 function appendThoughtSegment(text) {
@@ -3719,16 +3724,7 @@ function appendReasoningChunk(text) {
   if (!t) return;
   setThinkingStatus('模型思考中...');
   recordReasoningChunk(t);
-  if (activeAsk?.msgWrap) {
-    const body = activeAsk.msgWrap.querySelector('.msg-body');
-    if (body) {
-      activeAsk.full = (activeAsk.full || '') + t;
-      appendAgentStreamToken(body, t);
-      activeAsk.sawChunk = true;
-      activeAsk.msgWrap.classList.remove('pending');
-      return;
-    }
-  }
+  scrollChatStreaming();
 }
 
 /**
@@ -3740,28 +3736,7 @@ function appendThoughtCapture(ev) {
   if (!msg) return;
   setThinkingStatus('模型思考中...');
   recordThoughtSnapshot(msg);
-  if (!activeAsk?.msgWrap) return;
-  const body = activeAsk.msgWrap.querySelector('.msg-body');
-  if (!body) return;
-  const cur = String(activeAsk.full || '').trim();
-  let next = msg;
-  if (!cur || cur === msg) {
-    next = msg;
-  } else if (msg.startsWith(cur)) {
-    next = msg;
-  } else if (cur.startsWith(msg)) {
-    next = cur;
-  } else if (cur.includes(msg)) {
-    next = cur;
-  } else {
-    next = `${cur}\n\n${msg}`;
-  }
-  if (next !== cur) {
-    setAgentStreamText(body, next);
-    activeAsk.full = next;
-  }
-  activeAsk.sawChunk = true;
-  activeAsk.msgWrap.classList.remove('pending');
+  scrollChatStreaming();
 }
 
 function isReasoningToken(m) {
@@ -6910,7 +6885,9 @@ btnSend.addEventListener('click', async () => {
   try {
     await ask(prompt, sid, attachments);
     setStatus('就绪');
-    if (!sidePanel.classList.contains('hidden')) showTab(document.querySelector('.side-tab.active').dataset.tab);
+    // 问答完成不能隐式重载当前信息页签。showTab() 会调用 tab loader，
+    // 导致文件树、Core 表单/结果、滚动位置和用户当前操作被整体重建。
+    // 数据刷新由页签点击或各面板的显式刷新/查询按钮触发。
   } catch (e) {
     if (e.name !== 'AbortError') appendMsg('system', `错误: ${e.message}`);
     setStatus('出错');

@@ -64,7 +64,9 @@ ensureStarted() ->
 %%--------------------------------------------------------------------
 -spec lookup(binary() | list()) -> {ok, binary()} | miss.
 lookup(Question) ->
-    case enabled() of
+    %% lookup 也要重新做资格检查：旧版本可能已经落盘了时效性问题，
+    %% 仅在 put 侧拦截无法阻止这些历史条目继续命中。
+    case enabled() andalso isCacheableQuestion(Question) of
         false -> miss;
         true ->
             Fp = questionFingerprint(Question),
@@ -185,8 +187,9 @@ questionFingerprint(Question) ->
 
 %%--------------------------------------------------------------------
 %% @doc
-%% 写意图判定：问题含改/删/写/建/重命名等动作词时不缓存——这类答案
-%% 依赖实时状态，且缓存跳过工具循环有安全风险。
+%% 缓存资格判定：写意图和时效性问题都不缓存。后者即使引用了源码文件，
+%% 也可能依赖网页、Git HEAD、运行时或「是否已经完成」等文件 mtime 无法
+%% 完整表达的状态；缓存命中会直接跳过工具循环，宁可重查也不要返回旧答案。
 %% @end
 %%--------------------------------------------------------------------
 -spec isCacheableQuestion(binary() | list()) -> boolean().
@@ -199,7 +202,20 @@ isCacheableQuestion(Question) ->
         <<"重命名"/utf8>>, <<"回滚"/utf8>>, <<"drop table">>, <<"delete from">>,
         <<"写入"/utf8>>, <<"覆盖"/utf8>>, <<"上线"/utf8>>, <<"发布"/utf8>>
     ],
-    not lists:any(fun(C) -> binary:match(Lower, C) =/= nomatch end, WriteCues).
+    VolatileCues = [
+        <<"当前"/utf8>>, <<"现在"/utf8>>, <<"目前"/utf8>>, <<"最新"/utf8>>,
+        <<"最近"/utf8>>, <<"今天"/utf8>>, <<"今日"/utf8>>, <<"昨天"/utf8>>,
+        <<"刚刚"/utf8>>, <<"此刻"/utf8>>, <<"实时"/utf8>>, <<"截至"/utf8>>,
+        <<"是否已经"/utf8>>, <<"有没有完成"/utf8>>, <<"as of">>, <<"real-time">>
+    ],
+    EnglishVolatile = [<<"current">>, <<"latest">>, <<"recent">>, <<"recently">>,
+                       <<"today">>, <<"yesterday">>, <<"now">>, <<"live">>,
+                       <<"realtime">>, <<"status">>],
+    Tokens = normalizeQuestion(Lower),
+    not lists:any(fun(C) -> binary:match(Lower, C) =/= nomatch end, WriteCues)
+        andalso not lists:any(fun(C) -> binary:match(Lower, C) =/= nomatch end,
+                              VolatileCues)
+        andalso not lists:any(fun(T) -> lists:member(T, EnglishVolatile) end, Tokens).
 
 %%--------------------------------------------------------------------
 %% @doc

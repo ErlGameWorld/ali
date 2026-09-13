@@ -969,21 +969,15 @@ maybeAutoDistill(#state{sessionId = SessionId}) ->
     ShouldDistill = maps:get(autoDistillMemories, Agent, true),
     case ShouldDistill of
         true ->
-            spawn(fun() ->
-                try
-                    {ok, Session} = alSessionMgr:getContext(SessionId),
-                    Messages = maps:get(messages, Session, []),
-                    case length(Messages) >= 4 of
-                        true ->
-                            _ = alMemory:distill(SessionId, #{messages => Messages}),
-                            ok;
-                        false ->
-                            ok
-                    end
-                catch
-                    Class:Reason ->
-                        logger:warning("session_worker auto-distill failed: ~p:~p",
-                                       [Class, Reason])
+            alAsync:run(sessionAutoDistill, fun() ->
+                {ok, Session} = alSessionMgr:getContext(SessionId),
+                Messages = maps:get(messages, Session, []),
+                case length(Messages) >= 4 of
+                    true ->
+                        _ = alMemory:distill(SessionId, #{messages => Messages}),
+                        ok;
+                    false ->
+                        ok
                 end
             end);
         false ->

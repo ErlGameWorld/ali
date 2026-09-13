@@ -64,6 +64,14 @@ write_intent_not_cacheable_test() ->
               <<"DROP TABLE users">>, <<"把超时改成 5 秒"/utf8>>,
               <<"新建一个 supervisor"/utf8>>, <<"DELETE FROM t"/utf8>>]].
 
+volatile_question_not_cacheable_test() ->
+    [?assertNot(alSemanticCache:isCacheableQuestion(Q))
+     || Q <- [<<"现在项目编译通过了吗"/utf8>>, <<"最新提交是什么"/utf8>>,
+              <<"今天的状态如何"/utf8>>, <<"current process status">>,
+              <<"what changed recently">>, <<"what is the latest?">>]],
+    %% 稳定的原理/用法问题仍可缓存。
+    ?assert(alSemanticCache:isCacheableQuestion(<<"解释 gen_server 回调流程"/utf8>>)).
+
 files_fingerprint_test() ->
     ?assertEqual(<<>>, alSemanticCache:filesFingerprint([])),
     ?assertEqual(<<>>, alSemanticCache:filesFingerprint([<<>>, undefined])),
@@ -159,6 +167,9 @@ put_refuses_unqualified_entries_test() ->
         %% 写意图问题：不缓存
         ok = alSemanticCache:put(<<"修改超时配置"/utf8>>, ?LongAnswer, [Anchor]),
         ?assertEqual(miss, alSemanticCache:lookup(<<"修改超时配置"/utf8>>)),
+        %% 时效性问题即便有文件锚点也不得缓存。
+        ok = alSemanticCache:put(<<"现在编译通过了吗"/utf8>>, ?LongAnswer, [Anchor]),
+        ?assertEqual(miss, alSemanticCache:lookup(<<"现在编译通过了吗"/utf8>>)),
         %% 非法形状：静默 ok
         ok = alSemanticCache:put(not_binary, ?LongAnswer, [Anchor])
     after

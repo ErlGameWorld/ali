@@ -633,26 +633,20 @@ listSummaryTopics() ->
     end.
 
 spawnBuild(Meta, WaitIndex) ->
-    spawn(fun() ->
-        try
-            case WaitIndex of
-                true -> waitIndexQuiet(maps:get(digestWaitIndexMs,
-                    alConfig:get(agent, #{}), 600000));
-                false -> ok
-            end,
-            case build(#{}) of
-                {ok, Result} ->
-                    logger:info("alProjectDigest: build ok (~p) meta=~p",
-                                [maps:get(reason, Meta, unknown),
-                                 maps:with([moduleCount, actionCount, tableCount], Result)]);
-                {error, Reason} ->
-                    logger:warning("alProjectDigest: build failed (~p): ~p",
-                                   [maps:get(reason, Meta, unknown), Reason])
-            end
-        catch C:R:S ->
-            logger:warning("alProjectDigest: build crash (~p) ~p:~p ~p",
-                           [maps:get(reason, Meta, unknown), C, R,
-                            lists:sublist(S, 5)])
+    _ = alAsync:run({projectDigestBuild, maps:get(reason, Meta, unknown)}, fun() ->
+        case WaitIndex of
+            true -> waitIndexQuiet(maps:get(digestWaitIndexMs,
+                alConfig:get(agent, #{}), 600000));
+            false -> ok
+        end,
+        case build(#{}) of
+            {ok, Result} ->
+                logger:info("alProjectDigest: build ok (~p) meta=~p",
+                            [maps:get(reason, Meta, unknown),
+                             maps:with([moduleCount, actionCount, tableCount], Result)]);
+            {error, Reason} ->
+                logger:warning("alProjectDigest: build failed (~p): ~p",
+                               [maps:get(reason, Meta, unknown), Reason])
         end
     end),
     ok.
@@ -1711,9 +1705,8 @@ buildModuleContext(Mod, File, Idx, WarmLlm, Bucket, AbsPath, Mtime) ->
         undefined ->
             case WarmLlm of
                 true ->
-                    spawn(fun() ->
-                        try alModuleSummary:generate(Mod) catch _:_ -> ok end
-                    end);
+                    alAsync:run({moduleSummaryWarm, Mod},
+                        fun() -> alModuleSummary:generate(Mod) end);
                 false -> ok
             end,
             alModuleSummary:fallbackSummary(Mod)

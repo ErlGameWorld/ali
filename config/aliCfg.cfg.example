@@ -239,6 +239,9 @@
    %% 0=关闭复审；>0=同步复审后再把该答案展示给用户（不要后台另审一份）
    %% 答案复审：0=关；1=云 critic 快速审（推荐 local+cloud 链）；3=多轮修订
    maxCriticRounds => 1,
+   %% 复审在最终 answer 前同步执行，建议关深度思考以避免长时间白等。
+   criticThinking => disabled,
+   criticTimeoutMs => 45000,
    skillsEnabled => true,
    skillsDir => "skills",
    maxActiveSkills => 3,

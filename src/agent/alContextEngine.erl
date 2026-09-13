@@ -818,25 +818,10 @@ fetchRuntime(_, _, _) ->
 %% @end
 %%--------------------------------------------------------------------
 needsRuntime(Question) ->
-    Q = string:lowercase(toBinary(Question)),
-    Keywords = [
-        <<"进程"/utf8>>, <<"ets"/utf8>>, <<"内存"/utf8>>,
-        <<"监督"/utf8>>, <<"消息队列"/utf8>>, <<"运行时"/utf8>>,
-        <<"快照"/utf8>>, <<"节点"/utf8>>,
-        <<"process">>, <<"ets">>, <<"memory">>,
-        <<"pid">>, <<"supervisor">>, <<"message_queue">>,
-        <<"messagequeue">>, <<"reductions">>, <<"runtime">>, <<"snapshot">>,
-        <<"node">>, <<"scheduler">>, <<"heap">>, <<"runqueue">>, <<"run_queue">>
-    ] ++ projectLiveDataBins(),
-    lists:any(fun(K) -> binary:match(Q, K) =/= nomatch end, Keywords).
+    %% 与工具路由共用同一套“实体 + 观测意图”判定，避免上下文阶段先
+    %% 抓了 runtime，而工具阶段又认为这是普通代码/概念问答。
+    alToolRouter:isRuntimeQuestion(Question).
 
-projectLiveDataBins() ->
-    try
-        [unicode:characters_to_binary(K)
-         || K <- alProjectDigest:liveDataKeywords() ++ alProjectDigest:liveDataOpKeywords()]
-    catch _:_ ->
-        []
-    end.
 %%--------------------------------------------------------------------
 %% @doc
 %% 压缩 runtime snapshot：仅保留关键指标，避免上下文爆炸。

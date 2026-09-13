@@ -975,17 +975,29 @@ streamChatLoop(Gate, TaskId, Acc, StreamPid, Messages, LlmOpts) ->
             out(Gate, encodeMsg(#{type => answer, taskId => TaskId, text => FinalContent})),
             out(Gate, encodeMsg(#{type => done, taskId => TaskId}));
         {eStreamError, Reason} ->
-            %% 中途失败：回退非流式（内部沿模型链升级）。已推过的 token 不重推，
-            %% 仅以 answer 帧给最终内容（前端以 answer 为准替换显示）。
-            logger:warning("alWs streamChat mid-stream error (~p), fallback", [Reason]),
-            case alLlmClient:chatWithTools(Messages, [], LlmOpts) of
-                {ok, #{content := Bin} = _Reply} when is_binary(Bin), Bin =/= <<>> ->
-                    out(Gate, encodeMsg(#{type => answer, taskId => TaskId, text => Bin})),
+            %% eWCli 的 streamStarted 边界必须遵守：body 已推送后不再发一次
+            %% 同步请求，否则会重复计费并让用户额外等待。有部分正文时
+            %% 保留它作为降级结果；只在首包前失败时才安全回退。
+            case alLlmClient:streamFallbackSafe(Reason) of
+                false when Acc =/= <<>> ->
+                    logger:warning("alWs streamChat stopped after body (~p), keeping partial", [Reason]),
+                    out(Gate, encodeMsg(#{type => answer, taskId => TaskId, text => Acc})),
                     out(Gate, encodeMsg(#{type => done, taskId => TaskId}));
-                _ ->
+                false ->
                     out(Gate, encodeMsg(#{type => error, taskId => TaskId,
                                                   error => toBinary(io_lib:format("~p", [Reason]))})),
-                    out(Gate, encodeMsg(#{type => done, taskId => TaskId}))
+                    out(Gate, encodeMsg(#{type => done, taskId => TaskId}));
+                true ->
+                    logger:warning("alWs streamChat pre-body error (~p), fallback", [Reason]),
+                    case alLlmClient:chatWithTools(Messages, [], LlmOpts) of
+                        {ok, #{content := Bin} = _Reply} when is_binary(Bin), Bin =/= <<>> ->
+                            out(Gate, encodeMsg(#{type => answer, taskId => TaskId, text => Bin})),
+                            out(Gate, encodeMsg(#{type => done, taskId => TaskId}));
+                        _ ->
+                            out(Gate, encodeMsg(#{type => error, taskId => TaskId,
+                                                          error => toBinary(io_lib:format("~p", [Reason]))})),
+                            out(Gate, encodeMsg(#{type => done, taskId => TaskId}))
+                    end
             end;
         {eStreamToolCalls, _Deltas} ->
             streamChatLoop(Gate, TaskId, Acc, StreamPid, Messages, LlmOpts);
@@ -993,7 +1005,9 @@ streamChatLoop(Gate, TaskId, Acc, StreamPid, Messages, LlmOpts) ->
             out(Gate, encodeMsg(#{type => error, taskId => TaskId,
                                           error => toBinary(io_lib:format("stream process died: ~p", [Reason]))})),
             out(Gate, encodeMsg(#{type => done, taskId => TaskId}))
-    after 120000 ->
+    %% HTTP 层自己按 firstByteTimeout/chunkIdleTimeout 报错；这里只做最后
+    %% 的泄漏保护。旧的 120s 比当前 180s 模型首包上限还短，会误判慢思考。
+    after 1800000 ->
         out(Gate, encodeMsg(#{type => error, taskId => TaskId, error => timeout})),
         out(Gate, encodeMsg(#{type => done, taskId => TaskId}))
     end.

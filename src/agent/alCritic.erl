@@ -37,12 +37,10 @@ review(Question, Answer, Context) ->
 %% @end
 %%--------------------------------------------------------------------
 review(Question, Answer, Context, Opts) ->
-    %% 复审只产出 JSON 评判，用浅思考（GLM budget=low）大幅降低同步
-    %% 等待；链项配置 thinkingBudget 时以链项为准（extra 覆盖 per-call）。
-    Opts1 = case maps:is_key(thinkingBudget, Opts) of
-        true -> Opts;
-        false -> Opts#{thinkingBudget => low}
-    end,
+    %% critic 位于主模型流结束之后，任何慢思考都会表现为“思考已完成但
+    %% 最终答案迟迟不出”。默认禁用深度思考并给独立短超时；仍可通过
+    %% agent.criticThinking / criticTimeoutMs 显式放开。
+    Opts1 = criticCallOpts(Opts),
     case alLlmClient:chat(criticMessages(Question, Answer, Context), Opts1) of
         {ok, Reply} ->
             Content = maps:get(content, Reply, <<>>),
@@ -259,11 +257,8 @@ revise(Question, Draft, Critique, Context, Opts) ->
             context => Context
         }}
     ],
-    %% 修订同样是同步阻塞调用，浅思考降低等待（同 review/4）。
-    Opts1 = case maps:is_key(thinkingBudget, Opts) of
-        true -> Opts;
-        false -> Opts#{thinkingBudget => low}
-    end,
+    %% 修订同样处在终答前的同步关键路径，共用 critic 快速选项。
+    Opts1 = criticCallOpts(Opts),
     case alLlmClient:chat(Messages, Opts1) of
         {ok, #{content := Content}} when Content =/= null, Content =/= undefined ->
             Content;
@@ -272,6 +267,19 @@ revise(Question, Draft, Critique, Context, Opts) ->
                 true -> Draft#{criticWarning => Feedback, verdict => maps:get(verdict, Critique, warn)};
                 false -> #{answer => Draft, criticWarning => Feedback, verdict => maps:get(verdict, Critique, warn)}
             end
+    end.
+
+criticCallOpts(Opts) ->
+    AgentCfg = alConfig:getAgentCfg(),
+    Timeout = maps:get(criticTimeoutMs, Opts,
+                       maps:get(criticTimeoutMs, AgentCfg, 45000)),
+    Thinking = maps:get(criticThinking, Opts,
+                        maps:get(criticThinking, AgentCfg, disabled)),
+    Base = Opts#{llmRecvTimeout => Timeout, thinking => Thinking},
+    case Thinking of
+        disabled -> Base#{allowThinking => false};
+        false -> Base#{allowThinking => false};
+        _ -> Base#{thinkingBudget => maps:get(thinkingBudget, Opts, low)}
     end.
 
 %%--------------------------------------------------------------------
@@ -341,11 +349,17 @@ criticMessages(Question, Answer, Context) ->
         <<"你是嵌入式 BEAM 节点上的 Erlang 专家审查员。\n"
           "只返回 JSON："
           "{\"verdict\":\"pass|warn|reject\",\"score\":0.0-1.0,\"feedback\":\"...\",\"safe\":true|false}。\n"
-          "PASS：答案使用了工具/runMfa/evalErl 结果，或正确说明工具失败。\n"
+          "先逐项核对：是否直接回答问题；关键结论是否被 context/工具结果支持；"
+          "路径、行号、MFA、运行时数字、网页引用是否真实出现；是否遗漏会改变结论的限制。\n"
+          "PASS：答案正确、相关、关键结论有充分依据；调用过工具本身不等于有依据。\n"
+          "WARN：结论基本正确，仅有不影响主结论的小遗漏或表达问题。\n"
+          "REJECT：答非所问、与证据矛盾、把推测写成事实、伪造引用/路径/MFA/数字，"
+          "或证据不足却给出确定结论。网页引用 [n] 必须确实支持紧邻主张。\n"
+          "一般常识题不强制调用工具；但若 context 已提供证据，必须优先以证据为准。\n"
           "PASS：用 runMfa 做单次线上 MFA，或用 evalErl 拼装多步业务——这是预期能力。\n"
           "PASS：用户问提交/diff/审核时，答案基于 lastCommit/commitDiff/reviewChangeImpact 即可；"
           "不要要求再去 getEts/getRuntime。\n"
-          "REJECT 仅当：halt/os:cmd/open_port、破坏性写入、或无工具证据却编造运行时数字。\n"
+          "安全上必须 REJECT：halt/os:cmd/open_port、未经授权的破坏性写入。\n"
           "若用户问的是提交审核，而草稿却是节点运行时快照——判 warn，并要求改回提交审核结论"
           "（不要再扩写 runtime）。\n"
           "不要仅因建议或使用 runMfa/evalErl 而 reject。"

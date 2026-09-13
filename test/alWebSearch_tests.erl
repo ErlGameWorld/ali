@@ -210,6 +210,18 @@ add_result_indexes_test() ->
         [#{title => <<"a">>, url => <<"u1">>}, #{title => <<"b">>, url => <<"u2">>}]),
     ?assertEqual([1, 2], [maps:get(index, R) || R <- Indexed]).
 
+sources_with_pages_preserves_snippet_test() ->
+    Results = [#{index => 1, title => <<"A">>, url => <<"https://a">>,
+                 snippet => <<"summary-a">>},
+               #{index => 2, title => <<"B">>, url => <<"https://b">>,
+                 snippet => <<"summary-b">>}],
+    Sources = alWebSearch:sourcesWithPages(
+        Results, [{<<"https://a">>, <<"A">>, <<"full-a">>}]),
+    [A, B] = Sources,
+    ?assertEqual(<<"full-a">>, maps:get(pageText, A)),
+    ?assertEqual(<<"summary-a">>, maps:get(snippet, A)),
+    ?assertEqual(<<"summary-b">>, maps:get(snippet, B)).
+
 build_web_qa_messages_test() ->
     Sources = [#{index => 1, title => <<"T1">>, url => <<"https://a.com">>,
                  pageText => <<"body of a"/utf8>>},
@@ -222,5 +234,7 @@ build_web_qa_messages_test() ->
     ?assertEqual(<<"user">>, maps:get(role, User)),
     ?assert(binary:match(maps:get(content, User), <<"[1] T1">>) =/= nomatch),
     ?assert(binary:match(maps:get(content, User), <<"body of a">>) =/= nomatch),
+    ?assert(binary:match(maps:get(content, User), <<"网页正文"/utf8>>) =/= nomatch),
+    ?assert(binary:match(maps:get(content, User), <<"搜索摘要"/utf8>>) =/= nomatch),
     %% 无 pageText 的来源回退 snippet
     ?assert(binary:match(maps:get(content, User), <<"snip">>) =/= nomatch).

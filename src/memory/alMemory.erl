@@ -356,7 +356,7 @@ rowField(Row, BinaryKey, AtomKey, Default) ->
 %% @end
 %%--------------------------------------------------------------------
 maybeIndexMemory(Id, Content) ->
-    spawn(fun() ->
+    _ = alAsync:run(memoryIndex, fun() ->
         case alCoreClient:memoryUpsert(Id, Content) of
             {ok, #{data := #{ok := true}}} ->
                 ok;
@@ -951,7 +951,7 @@ indexRow(Row, {Indexed, Failed, Skipped}) ->
     end.
 
 maybeDeleteMemoryIndex(Id) ->
-    spawn(fun() ->
+    _ = alAsync:run(memoryIndexDelete, fun() ->
         case alCoreClient:memoryDelete(Id) of
             {ok, _} -> ok;
             {error, Reason} ->

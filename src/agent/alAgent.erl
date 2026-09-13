@@ -112,10 +112,12 @@ runWithToolsAndCritic(Question, Opts1, SessionId, MaxToolSteps, MaxCriticRounds)
             Final = markCriticWarning(Final0, Critique),
             Trace1 = maps:get(trace, ToolResult1, Trace),
             ToolCalls1 = maps:get(toolCalls, ToolResult1, ToolCalls),
-            _ = recordSessionArtifacts(SessionId, Final, Critique, Trace1, ToolCalls1, Opts1),
-            %% 记忆/经验/缓存沉淀只影响后续轮次，与本次答案无关：
-            %% 全部后台执行（内含 aux 角色 LLM 提炼，同步跑会让前端在
-            %% 思考流结束后白等数十秒才收到 answer 帧）。
+            %% 会话工件（summary/trace/critique/tokenUsage）与记忆沉淀都只影响
+            %% 后续轮次/审计，与本次答案无关：全部后台执行，避免前端在思考流
+            %% 结束后还白等工件落盘（文件后端重写大 JSONL 可达数秒）。
+            spawnMonitoredJob(fun() ->
+                recordSessionArtifacts(SessionId, Final, Critique, Trace1, ToolCalls1, Opts1)
+            end),
             spawnMonitoredJob(fun() ->
                 persistTurnKnowledge(SessionId, Question, Final, Critique, Trace1, Opts1)
             end),
@@ -203,21 +205,9 @@ emitAgentProgress(Opts, Event) when is_map(Opts), is_map(Event) ->
 emitAgentProgress(_, _) ->
     ok.
 
-%% 后台任务统一 spawn_monitor：立即返回不阻塞主流程，但由独立 watcher 进程
-%% 消费 DOWN，异常退出记日志，避免裸 spawn 崩溃无声。
+%% 后台任务统一在子进程边界捕获 error/exit/throw 并记录，立即返回。
 spawnMonitoredJob(Fun) ->
-    {Pid, MonRef} = spawn_monitor(Fun),
-    %% 主进程不消费 DOWN，先解除自己的 monitor 并 flush，避免消息残留。
-    _ = erlang:demonitor(MonRef, [flush]),
-    _ = spawn(fun() ->
-        WatcherRef = erlang:monitor(process, Pid),
-        receive
-            {'DOWN', WatcherRef, process, Pid, normal} -> ok;
-            {'DOWN', WatcherRef, process, Pid, noproc} -> ok;
-            {'DOWN', WatcherRef, process, Pid, Reason} ->
-                logger:warning("alAgent background job ~p exited abnormally: ~p", [Pid, Reason])
-        end
-    end),
+    _ = alAsync:run(alAgent, Fun),
     ok.
 
 %%--------------------------------------------------------------------
@@ -239,14 +229,30 @@ recordSessionArtifacts(SessionId, Final, Critique, Trace, ToolCalls, Opts) ->
         lastUpdated => erlang:system_time(millisecond),
         toolCallCount => length(ToolCalls)
     },
-    logArtifactError(setSummary, alSessionMgr:setSummary(SessionId, Summary)),
-    lists:foreach(fun(Entry) ->
-        logArtifactError(appendToolTrace, alSessionMgr:appendToolTrace(SessionId, Entry))
-    end, Trace),
-    logArtifactError(appendCritique, alSessionMgr:appendCritique(SessionId, Critique)),
+    safeArtifact(setSummary, fun() -> alSessionMgr:setSummary(SessionId, Summary) end),
+    %% 批量写入：一次调用写入整批 trace，避免 N 次串行 gen_server:call
+    %% 各自落盘一次 artifacts（逐条 appendToolTrace 会 N 倍放大 IO）。
+    safeArtifact(appendToolTraces,
+                 fun() -> alSessionMgr:appendToolTraces(SessionId, Trace) end),
+    safeArtifact(appendCritique, fun() -> alSessionMgr:appendCritique(SessionId, Critique) end),
     case maps:get(tokenUsage, Opts, undefined) of
         undefined -> ok;
-        Usage -> logArtifactError(addTokenUsage, alSessionMgr:addTokenUsage(SessionId, Usage))
+        Usage -> safeArtifact(addTokenUsage, fun() -> alSessionMgr:addTokenUsage(SessionId, Usage) end)
+    end.
+
+%% 在 fun 内部求值会话工件写入，确保 exit/throw 也被兜住。
+%% 关键：`alSessionMgr:xxx(...)` 作为 logArtifactError/2 的**参数**求值时
+%% 抛出的 exit 不会被该函数捕获——必须在调用点包 try，否则 gen_server:call
+%% 超时（或目标进程 noproc）会直接逃逸，把「记录失败」升级成「agent 崩溃」。
+safeArtifact(Op, Fun) ->
+    try Fun() of
+        Result -> logArtifactError(Op, Result)
+    catch
+        exit:Reason ->
+            logger:warning("alAgent session artifact ~p exited: ~p", [Op, Reason]);
+        Class:Reason:Stack ->
+            logger:warning("alAgent session artifact ~p crashed: ~p:~p~n~p",
+                           [Op, Class, Reason, Stack])
     end.
 
 %% 会话工件写入失败不阻断主流程，但必须留痕，便于排查「记忆/审计缺失」。
@@ -292,7 +298,9 @@ resumeAfterApproval(Continuation, ApprovedToolContent, Opts) ->
             Final0 = maps:get(finalDraft, CritiqueLoop, Draft),
             Critique = maps:get(critique, CritiqueLoop),
             Final = markCriticWarning(Final0, Critique),
-            _ = recordSessionArtifacts(SessionId, Final, Critique, Trace, ToolCalls, Opts1),
+            spawnMonitoredJob(fun() ->
+                recordSessionArtifacts(SessionId, Final, Critique, Trace, ToolCalls, Opts1)
+            end),
             spawnMonitoredJob(fun() ->
                 persistTurnKnowledge(SessionId, Question, Final, Critique, Trace, Opts1)
             end),
@@ -313,7 +321,9 @@ resumeAfterApproval(Continuation, ApprovedToolContent, Opts) ->
             Final0 = maps:get(finalDraft, CritiqueLoop, Draft),
             Critique = maps:get(critique, CritiqueLoop),
             Final = markCriticWarning(Final0, Critique),
-            _ = recordSessionArtifacts(SessionId, Final, Critique, Trace, [], Opts1),
+            spawnMonitoredJob(fun() ->
+                recordSessionArtifacts(SessionId, Final, Critique, Trace, [], Opts1)
+            end),
             spawnMonitoredJob(fun() ->
                 persistTurnKnowledge(SessionId, Question, Final, Critique, Trace, Opts1)
             end),
@@ -584,7 +594,7 @@ maybeAutoDistill(SessionId, Opts) ->
 
 %% 会话消息达到一定量级才蒸馏，避免每轮单次问答都触发 LLM 提炼。
 enoughMessagesForDistill(SessionId) ->
-    case alSessionMgr:getContext(SessionId) of
+    case safeSessionCall(fun() -> alSessionMgr:getContext(SessionId) end) of
         {ok, #{messages := Messages}} -> length(Messages) >= 4;
         _ -> false
     end.
@@ -596,7 +606,19 @@ maybeAppendMessage(undefined, _Opts, _Message) ->
 maybeAppendMessage(SessionId, Opts, Message) ->
     case maps:get(persistMemory, Opts, true) of
         false -> ok;
-        true -> _ = alSessionMgr:appendMessage(SessionId, Message), ok
+        true ->
+            %% 消息落库失败（超时/进程不可用）不应中断问答主流程。
+            _ = safeSessionCall(fun() -> alSessionMgr:appendMessage(SessionId, Message) end),
+            ok
+    end.
+
+%% 会话层调用统一兜底：把 gen_server:call 的 timeout / noproc 等 exit
+%% 转成 {error, _}，避免会话持久化故障升级为 agent 崩溃。
+safeSessionCall(Fun) when is_function(Fun, 0) ->
+    try Fun()
+    catch
+        exit:Reason -> {error, Reason};
+        Class:Reason -> {error, {Class, Reason}}
     end.
 
 %%--------------------------------------------------------------------

@@ -83,6 +83,11 @@ match_runtime_ets_test() ->
     Matched = alSkill:match(Q),
     ?assert(lists:member(<<"runtime-inspect">>, Matched)).
 
+runtime_skill_not_injected_for_process_concept_test() ->
+    alSkill:cacheClear(),
+    Matched = alContext:activeSkills(<<"process 是什么意思"/utf8>>),
+    ?assertNot(lists:member(<<"runtime-inspect">>, Matched)).
+
 match_nl_live_exec_test() ->
     alSkill:cacheClear(),
     Q = unicode:characters_to_binary("帮我在某个点修建一个建筑再给加 1000 钱"),

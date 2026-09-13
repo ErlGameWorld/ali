@@ -1,6 +1,6 @@
 ---
 name: runtime-inspect
-triggers: ["运行时", "ets", "进程", "process", "pid", "state", "snapshot", "mailbox", "supervisor", "getRuntime"]
+triggers: ["运行时", "ets", "当前进程", "进程状态", "process status", "pid 列表", "当前状态", "runtime snapshot", "mailbox", "supervisor tree", "getRuntime"]
 tools: [getRuntime, getEts, getProcesses, processInfo, etsLookup, supervisorTree, runMfa, searchCode, lookupAction, traceDataQuery]
 ---
 

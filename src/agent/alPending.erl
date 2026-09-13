@@ -34,10 +34,15 @@
 %% Test helpers reused by alPending_tests / alWebHandler diffs.
 -export([buildDiff/2, toBinary/1, persist/1, deletePersisted/1]).
 
+-ifdef(TEST).
+-export([callTimeoutMs/0]).
+-endif.
+
 -define(SERVER, ?MODULE).
 -define(TABLE, alPending).
 -define(DEFAULT_TTL_MS, 3600000).
 -define(CLEAN_INTERVAL_MS, 60000).
+-define(DEFAULT_CALL_TIMEOUT_MS, 30000).
 
 -record(state, {timer :: reference() | undefined}).
 
@@ -76,7 +81,12 @@ list() ->
     call(list).
 
 list(SessionId) ->
-    [E || E <- list(), maps:get(sessionId, E, undefined) =:= SessionId].
+    case list() of
+        Entries when is_list(Entries) ->
+            [E || E <- Entries, maps:get(sessionId, E, undefined) =:= SessionId];
+        {error, _} = Error ->
+            Error
+    end.
 
 %% Claim + execute outside the gen_server so resume/put cannot deadlock.
 approve(TaskId) ->
@@ -138,7 +148,30 @@ call(Req) ->
             %% Tests / degraded: operate on ETS directly with take semantics.
             directCall(Req);
         _ ->
-            gen_server:call(?SERVER, Req, infinity)
+            try gen_server:call(?SERVER, Req, callTimeoutMs()) of
+                Reply -> Reply
+            catch
+                exit:{timeout, _} ->
+                    logger:warning("alPending call timed out: ~p", [requestTag(Req)]),
+                    {error, pendingCallTimeout};
+                exit:Reason ->
+                    logger:warning("alPending call exited: ~p reason=~p",
+                                   [requestTag(Req), Reason]),
+                    {error, {pendingCallExit, Reason}}
+            end
+    end.
+
+requestTag({Tag, _, _, _, _, _}) -> Tag;
+requestTag({Tag, _, _}) -> Tag;
+requestTag({Tag, _}) -> Tag;
+requestTag(Tag) when is_atom(Tag) -> Tag;
+requestTag(_) -> unknown.
+
+callTimeoutMs() ->
+    case application:get_env(ali, pendingCallTimeoutMs,
+                             ?DEFAULT_CALL_TIMEOUT_MS) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> ?DEFAULT_CALL_TIMEOUT_MS
     end.
 
 %%%===================================================================

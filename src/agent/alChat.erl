@@ -700,22 +700,19 @@ refreshIndex(Opts) when is_map(Opts) ->
                             case waitIndexProgress(Timeout) of
                                 {ok, Status} ->
                                     _ = alProjectDigest:maybeBuildAfterIndex(),
-                                    _ = spawn(fun() ->
-                                        try
-                                            Recent = try alVcsIndex:recentFiles()
-                                                     catch _:_ -> [] end,
-                                            Paths = case is_list(Recent) of
-                                                true -> Recent;
-                                                false ->
-                                                    try ordsets:to_list(Recent)
-                                                    catch _:_ -> [] end
-                                            end,
-                                            alExperience:reconcileAfterCodeChange(#{
-                                                changed => Paths,
-                                                deleted => []
-                                            })
-                                        catch _:_ -> ok
-                                        end
+                                    _ = alAsync:run(chatReconcileAfterIndex, fun() ->
+                                        Recent = try alVcsIndex:recentFiles()
+                                                 catch _:_ -> [] end,
+                                        Paths = case is_list(Recent) of
+                                            true -> Recent;
+                                            false ->
+                                                try ordsets:to_list(Recent)
+                                                catch _:_ -> [] end
+                                        end,
+                                        alExperience:reconcileAfterCodeChange(#{
+                                            changed => Paths,
+                                            deleted => []
+                                        })
                                     end),
                                     {ok, #{roots => Roots, results => StartRes,
                                            waited => true, status => Status}};

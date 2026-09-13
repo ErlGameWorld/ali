@@ -865,12 +865,7 @@ auditMfa(Module, Function, Args, Caller) ->
         at => erlang:system_time(second)
     },
     logger:info("ali runMfa audit ~p", [Entry]),
-    spawn(fun() ->
-        try persistAudit(Entry)
-        catch Class:Reason ->
-            logger:warning("runMfa audit persist crashed: ~p:~p", [Class, Reason])
-        end
-    end),
+    _ = alAsync:run(runMfaAuditPersist, fun() -> persistAudit(Entry) end),
     ok.
 
 %% 异步将审计条目写入本地数据库的 simulation_runs 表；插入失败记录日志。

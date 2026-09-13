@@ -87,18 +87,12 @@ getOrGenerate(Module) ->
         {ok, Summary} ->
             {ok, Summary};
         undefined ->
-            spawn(fun() ->
-                try
-                    case generate(Module) of
-                        {ok, _} -> ok;
-                        {error, GenErr} ->
-                            logger:debug("alModuleSummary generate failed for ~p: ~p",
-                                         [Module, GenErr])
-                    end
-                catch
-                    Class:CrashErr ->
-                        logger:debug("alModuleSummary generate crashed: ~p:~p",
-                                     [Class, CrashErr])
+            _ = alAsync:run({moduleSummaryGenerate, Module}, fun() ->
+                case generate(Module) of
+                    {ok, _} -> ok;
+                    {error, GenErr} ->
+                        logger:debug("alModuleSummary generate failed for ~p: ~p",
+                                     [Module, GenErr])
                 end
             end),
             undefined

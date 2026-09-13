@@ -45,7 +45,7 @@
          clampLimit/1, stripHtml/1, engineList/0, autoEngineChain/1,
          extractMainContent/1, normalizeFreshness/1, freshnessParam/2,
          addResultIndexes/1, decodeEntities/1, buildWebQaMessages/2,
-         snippetDigest/1]).
+         snippetDigest/1, sourcesWithPages/2]).
 
 -define(DefaultMaxResults, 5).
 -define(MaxResults, 10).
@@ -340,7 +340,10 @@ sourcesWithPages(Results, Pages) ->
     PageMap = maps:from_list([{Url, Text} || {Url, _Title, Text} <- Pages]),
     [begin
         Src0 = #{index => maps:get(index, R, I), title => maps:get(title, R, <<>>),
-                 url => maps:get(url, R, <<>>)},
+                 url => maps:get(url, R, <<>>),
+                 %% 抓取失败以及 fetchLimit 之外的结果仍保留搜索摘要，
+                 %% 供汇总和无 LLM 降级答案使用。
+                 snippet => maps:get(snippet, R, <<>>)},
         case maps:find(Url, PageMap) of
             {ok, Text} -> Src0#{pageText => Text};
             error -> Src0
@@ -406,9 +409,14 @@ buildWebQaMessages(Question, Sources) ->
     User = iolist_to_binary([
         <<"问题："/utf8>>, Question, <<"\n\n资料：\n"/utf8>>,
         [begin
+             EvidenceKind = case maps:get(pageText, S, undefined) of
+                 undefined -> <<"搜索摘要"/utf8>>;
+                 _ -> <<"网页正文"/utf8>>
+             end,
              [<<"[", (intToBin(maps:get(index, S, I)))/binary, "] ",
                (maps:get(title, S, <<>>))/binary, "\n",
                (maps:get(url, S, <<>>))/binary, "\n",
+               "证据类型："/utf8, EvidenceKind/binary, "\n",
                (case maps:get(pageText, S, undefined) of
                     undefined -> maps:get(snippet, S, <<>>);
                     Text -> Text
@@ -418,9 +426,12 @@ buildWebQaMessages(Question, Sources) ->
     [
         #{role => <<"system">>,
           content => <<"你是严谨的网络检索助手。只依据给定资料回答问题；"
-                       "引用资料时句末标注 [n]（对应资料编号）；"
+                       "每个可核验的事实性结论都要在句末标注 [n]，编号只能来自资料；"
+                       "引用必须真正支持紧邻的结论，不能用只有标题或无内容的来源作证；"
+                       "优先采用网页正文，搜索摘要只作为低置信补充；资料冲突时明确指出；"
                        "回答末尾输出 Sources 列表（每行：[n] 标题 — URL）。"
-                       "资料不足以回答时如实说明，禁止编造。用中文回答。"/utf8>>},
+                       "Sources 中的标题和 URL 必须逐字复制资料，不得生成新链接。"
+                       "资料不足以回答时如实说明，禁止编造。回答语言与问题一致。"/utf8>>},
         #{role => <<"user">>, content => User}
     ].
 

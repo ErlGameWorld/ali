@@ -34,6 +34,24 @@ toolDefinitionsNonEmpty_test() ->
     Defs = alToolRouter:toolDefinitions(),
     ?assert(is_list(Defs) andalso length(Defs) > 0).
 
+runtime_tools_hidden_for_normal_question_test() ->
+    ?setup,
+    Defs = alToolRouter:toolDefinitions(#{mode => ask,
+        currentQuestion => <<"解释 gen_server 状态机如何工作"/utf8>>}),
+    Names = [maps:get(name, maps:get(function, D)) || D <- Defs],
+    ?assertNot(lists:member(<<"getRuntime">>, Names)),
+    ?assertNot(lists:member(<<"getProcesses">>, Names)),
+    ?assertNot(lists:member(<<"getEts">>, Names)).
+
+runtime_tools_exposed_for_runtime_question_test() ->
+    ?setup,
+    Defs = alToolRouter:toolDefinitions(#{mode => ask,
+        currentQuestion => <<"查看当前节点进程内存占用"/utf8>>}),
+    Names = [maps:get(name, maps:get(function, D)) || D <- Defs],
+    ?assert(lists:member(<<"getRuntime">>, Names)),
+    ?assert(lists:member(<<"getProcesses">>, Names)),
+    ?assert(lists:member(<<"getEts">>, Names)).
+
 callToolUnknown_test() ->
     ?setup,
     Result = alToolRouter:callTool(unknownToolXyz, #{}),
@@ -204,6 +222,10 @@ parseDirectExecCall_localtime_test() ->
         <<"to_bandit BanditCnt < BanditMaxNumLimit 并发超上限怎么解决"/utf8>>)),
     %% 通用 BEAM 信号仍算运行时；业务词不应写死在代码里
     ?assertEqual(true, alToolRouter:isRuntimeQuestion(<<"占用内存最高的 ets"/utf8>>)),
+    %% 只有实体词或泛化操作词不得把普通问答拖去 getRuntime
+    ?assertEqual(false, alToolRouter:isRuntimeQuestion(<<"process 是什么意思"/utf8>>)),
+    ?assertEqual(false, alToolRouter:isRuntimeQuestion(<<"执行这个问答"/utf8>>)),
+    ?assertEqual(true, alToolRouter:isRuntimeQuestion(<<"show current process status">>)),
     ?assertEqual(false, alToolRouter:isRuntimeQuestion(<<"查一下线上订单坐标"/utf8>>)).
 
 %% 「占用内存最高的 ets」应直达 getEts，避免模型只写「我来搜索」。
@@ -491,4 +513,3 @@ parse_call_expr_rejects_executable_args_test() ->
                  alToolRouter:parseCallExpr("foo:bar(<<(os:cmd(\"whoami\"))>>)")),
     ?assertEqual({ok, erlang, localtime, []},
                  alToolRouter:parseCallExpr("erlang:localtime()")).
-

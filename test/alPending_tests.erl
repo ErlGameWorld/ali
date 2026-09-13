@@ -3,6 +3,35 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+finite_call_timeout_config_test() ->
+    Old = application:get_env(ali, pendingCallTimeoutMs),
+    try
+        application:set_env(ali, pendingCallTimeoutMs, 1234),
+        ?assertEqual(1234, alPending:callTimeoutMs()),
+        application:set_env(ali, pendingCallTimeoutMs, infinity),
+        ?assertEqual(30000, alPending:callTimeoutMs())
+    after
+        case Old of
+            {ok, Value} -> application:set_env(ali, pendingCallTimeoutMs, Value);
+            undefined -> application:unset_env(ali, pendingCallTimeoutMs)
+        end
+    end.
+
+call_timeout_returns_error_instead_of_exit_test() ->
+    alPending:ensureStarted(),
+    Old = application:get_env(ali, pendingCallTimeoutMs),
+    ok = sys:suspend(alPending),
+    try
+        application:set_env(ali, pendingCallTimeoutMs, 10),
+        ?assertEqual({error, pendingCallTimeout}, alPending:get(<<"timeout-test">>))
+    after
+        ok = sys:resume(alPending),
+        case Old of
+            {ok, Value} -> application:set_env(ali, pendingCallTimeoutMs, Value);
+            undefined -> application:unset_env(ali, pendingCallTimeoutMs)
+        end
+    end.
+
 critical_exports_test() ->
     Exports = alPending:module_info(exports),
     [?assert(lists:member({F, A}, Exports))

@@ -23,6 +23,23 @@
 
 -define(SERVER, ?MODULE).
 
+%% 会话读写的默认 gen_server 调用超时。
+%% 与 alLocalDb 的 120s 落盘预算对齐：会话写路径最终会把整批 artifacts
+%% 落到文件后端，慢盘/大 JSONL 下可能远超默认的 5s。若沿用隐式 5s，
+%% 调用方（agent 收尾记录）会先超时退出，而服务端仍在继续写——
+%% 表现为「回答成功但 agent 崩溃」。
+-define(DefaultCallTimeoutMs, 60000).
+
+%% 读接口同样显式给超时，避免默认 5s 在 DB 回读（loadSession）时被击穿。
+call(Req) ->
+    gen_server:call(?SERVER, Req, callTimeoutMs()).
+
+callTimeoutMs() ->
+    case application:get_env(ali, sessionCallTimeoutMs, ?DefaultCallTimeoutMs) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> ?DefaultCallTimeoutMs
+    end.
+
 %%--------------------------------------------------------------------
 %% @doc
 %% 启动 alSessionMgr gen_server，并注册为本地名称 ?SERVER
@@ -42,7 +59,7 @@ start_link() ->
 %% @end
 %%--------------------------------------------------------------------
 createSession(User) ->
-    gen_server:call(?SERVER, {eCreateSession, User}).
+    call({eCreateSession, User}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -53,7 +70,7 @@ createSession(User) ->
 %% @end
 %%--------------------------------------------------------------------
 getContext(SessionId) ->
-    gen_server:call(?SERVER, {eGetContext, SessionId}).
+    call({eGetContext, SessionId}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -65,7 +82,7 @@ getContext(SessionId) ->
 %% @end
 %%--------------------------------------------------------------------
 appendMessage(SessionId, Message) ->
-    gen_server:call(?SERVER, {eAppendMessage, SessionId, Message}).
+    call({eAppendMessage, SessionId, Message}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -78,7 +95,7 @@ appendMessage(SessionId, Message) ->
 %% @end
 %%--------------------------------------------------------------------
 ensureSession(SessionId, User) ->
-    gen_server:call(?SERVER, {eEnsureSession, SessionId, User}).
+    call({eEnsureSession, SessionId, User}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -89,7 +106,7 @@ ensureSession(SessionId, User) ->
 %% @end
 %%--------------------------------------------------------------------
 clearMessages(SessionId) ->
-    gen_server:call(?SERVER, {eClearMessages, SessionId}).
+    call({eClearMessages, SessionId}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -102,7 +119,7 @@ clearMessages(SessionId) ->
 %%--------------------------------------------------------------------
 -spec exportSession(term()) -> {ok, binary()} | {error, term()}.
 exportSession(SessionId) ->
-    gen_server:call(?SERVER, {eExportSession, SessionId}).
+    call({eExportSession, SessionId}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -115,7 +132,7 @@ exportSession(SessionId) ->
 %%--------------------------------------------------------------------
 -spec importSession(binary()) -> {ok, term()} | {error, term()}.
 importSession(JsonBin) when is_binary(JsonBin) ->
-    gen_server:call(?SERVER, {eImportSession, JsonBin}).
+    call({eImportSession, JsonBin}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -129,7 +146,7 @@ importSession(JsonBin) when is_binary(JsonBin) ->
 %%--------------------------------------------------------------------
 -spec setSummary(term(), map()) -> ok | {error, term()}.
 setSummary(SessionId, Summary) when is_map(Summary) ->
-    gen_server:call(?SERVER, {eSetSummary, SessionId, Summary}).
+    call({eSetSummary, SessionId, Summary}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -143,7 +160,7 @@ setSummary(SessionId, Summary) when is_map(Summary) ->
 %%--------------------------------------------------------------------
 -spec appendToolTrace(term(), term()) -> ok | {error, term()}.
 appendToolTrace(SessionId, Entry) ->
-    gen_server:call(?SERVER, {
+    call({
         eAppendToolTrace,
         SessionId,
         normalizeToolTraceEntry(Entry)
@@ -166,7 +183,7 @@ appendToolTraces(_SessionId, []) ->
     ok;
 appendToolTraces(SessionId, Entries) when is_list(Entries) ->
     Normalized = [normalizeToolTraceEntry(E) || E <- Entries],
-    gen_server:call(?SERVER, {eAppendToolTraces, SessionId, Normalized}).
+    call({eAppendToolTraces, SessionId, Normalized}).
 
 %% alToolRouter 的 trace 使用紧凑二元组；会话持久化层统一转成
 %% JSON-safe map，避免 appendToolTrace/2 因 function_clause 杀死 agent。
@@ -197,7 +214,7 @@ normalizeToolTraceEntry(Other) ->
 %%--------------------------------------------------------------------
 -spec addTokenUsage(term(), map()) -> ok | {error, term()}.
 addTokenUsage(SessionId, Usage) when is_map(Usage) ->
-    gen_server:call(?SERVER, {eAddTokenUsage, SessionId, Usage}).
+    call({eAddTokenUsage, SessionId, Usage}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -210,7 +227,7 @@ addTokenUsage(SessionId, Usage) when is_map(Usage) ->
 %%--------------------------------------------------------------------
 -spec appendCritique(term(), map()) -> ok | {error, term()}.
 appendCritique(SessionId, Critique) when is_map(Critique) ->
-    gen_server:call(?SERVER, {eAppendCritique, SessionId, Critique}).
+    call({eAppendCritique, SessionId, Critique}).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -223,7 +240,7 @@ appendCritique(SessionId, Critique) when is_map(Critique) ->
 %%--------------------------------------------------------------------
 -spec getSessionFull(term()) -> {ok, map()} | {error, term()}.
 getSessionFull(SessionId) ->
-    gen_server:call(?SERVER, {eGetSessionFull, SessionId}).
+    call({eGetSessionFull, SessionId}).
 
 %%--------------------------------------------------------------------
 %% @doc

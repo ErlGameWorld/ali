@@ -406,7 +406,30 @@ readLinesRaw(Path) ->
             Lines = binary:split(Bin, <<"\n">>, [global]),
             [decodeLine(Line) || Line <- Lines, byte_size(Line) > 0];
         {error, enoent} ->
+            [];
+        {error, _} ->
             []
+    end.
+
+%% 按绝对路径读取（走同一套 mtime 读缓存）；文件不存在返回 []。
+readLinesAbs(Path) ->
+    case file:read_file_info(Path, [{time, posix}]) of
+        {ok, #file_info{mtime = Mtime}} ->
+            case lookupReadCache(Path, Mtime) of
+                {ok, Rows} -> Rows;
+                false ->
+                    Rows = readLinesRaw(Path),
+                    storeReadCache(Path, Mtime, Rows),
+                    Rows
+            end;
+        {error, _} ->
+            case lookupReadCache(Path, undefined) of
+                {ok, Rows} -> Rows;
+                false ->
+                    Rows = readLinesRaw(Path),
+                    storeReadCache(Path, undefined, Rows),
+                    Rows
+            end
     end.
 
 %%%===================================================================
@@ -548,36 +571,115 @@ sessionArtifactRowFromParams(Params) ->
     #{sessionId => undefined, params => Params}.
 
 %% 按 sessionId 过滤 session_artifacts，返回含 atom 键的行。
+%% 优先读分片文件；分片不存在时回退旧单体文件（兼容历史数据）。
 filterSessionArtifacts(Rows, [SessionId | _]) ->
     Sid = toComparable(SessionId),
-    [rowToAtoms(R) || R <- Rows,
+    Rows1 = case {Rows, readSessionArtifactRows(SessionId)} of
+        %% Rows 已由调用方传入（readLines("session_artifacts.jsonl")），
+        %% 但分片命中时以分片为准。
+        {_, ShardRows} when ShardRows =/= [] -> ShardRows;
+        {LegacyRows, _} when is_list(LegacyRows), LegacyRows =/= [] -> LegacyRows;
+        _ -> []
+    end,
+    [rowToAtoms(R) || R <- Rows1,
      toComparable(maps:get(<<"sessionId">>, R, maps:get(sessionId, R, undefined))) =:= Sid];
 filterSessionArtifacts(_, _) ->
     [].
 
-%% 删除 / 替换写入：INSERT OR REPLACE 语义 —— 先删同 sessionId，再 append。
+%% 删除 / 替换写入：INSERT OR REPLACE 语义。
+%%
+%% 关键优化：session_artifacts 每个 sessionId 只有一行，且写频率高
+%% （每次问答收尾都会 setSummary → INSERT OR REPLACE）。旧实现是
+%% 「读全文件 → 过滤 → tmp 重写 → append」，随会话数增长变成 O(n)，
+%% 单次可能耗时数秒，是 agent 收尾超时崩溃的根因。
+%%
+%% 现改为「按 sessionId 分片」：每个会话一个独立文件
+%% `session_artifacts/<sid>.jsonl`，写入直接覆盖该文件（O(1)），
+%% 完全不再触碰其它会话的数据。读取时按 sid 定位分片，
+%% 老的单体 `session_artifacts.jsonl` 仍兼容读取（渐进迁移）。
 insertSessionArtifact(Params) ->
     Row = sessionArtifactRowFromParams(Params),
-    Sid = maps:get(sessionId, Row, undefined),
-    _ = deleteSessionArtifacts([Sid]),
-    case appendLine("session_artifacts.jsonl", Row) of
-        ok -> {ok, Sid};
-        {error, _} = E -> E
+    case maps:get(sessionId, Row, undefined) of
+        undefined ->
+            {error, #{reason => missingSessionId}};
+        Sid ->
+            Path = sessionArtifactShardPath(Sid),
+            case filelib:ensure_dir(Path) of
+                ok ->
+                    %% 单行覆盖写：无需读取、无需 rename。
+                    case file:write_file(Path, [alJson:encode(Row), <<"\n">>]) of
+                        ok ->
+                            invalidateReadCachePath(Path),
+                            {ok, Sid};
+                        {error, Reason} ->
+                            {error, #{reason => writeFailed, detail => Reason}}
+                    end;
+                {error, Reason} ->
+                    {error, #{reason => writeFailed, detail => Reason}}
+            end
     end.
 
-%% 删除 session_artifacts 中指定 sessionId 的行。
+%% 会话分片文件绝对路径：session_artifacts/<safe-sid>.jsonl
+%% sid 进文件名前做安全化（仅保留字母数字与 -_），防止路径穿越。
+sessionArtifactShardPath(SessionId) ->
+    Safe = safeShardName(toBinarySafe(SessionId)),
+    File = <<Safe/binary, ".jsonl">>,
+    filename:join([storeDir(), "session_artifacts", File]).
+
+safeShardName(Bin) when is_binary(Bin) ->
+    case re:replace(Bin, <<"[^A-Za-z0-9_-]">>, <<"_">>, [global, {return, binary}]) of
+        <<>> -> <<"_">>;
+        Safe -> Safe
+    end;
+safeShardName(Other) ->
+    safeShardName(toBinarySafe(Other)).
+
+toBinarySafe(B) when is_binary(B) -> B;
+toBinarySafe(A) when is_atom(A) -> atom_to_binary(A, utf8);
+toBinarySafe(I) when is_integer(I) -> integer_to_binary(I);
+toBinarySafe(L) when is_list(L) ->
+    try unicode:characters_to_binary(L) of
+        Bin when is_binary(Bin) -> Bin;
+        _ -> iolist_to_binary(io_lib:format("~p", [L]))
+    catch _:_ -> iolist_to_binary(io_lib:format("~p", [L])) end;
+toBinarySafe(Other) -> iolist_to_binary(io_lib:format("~p", [Other])).
+
+%% 删除 session_artifacts 中指定 sessionId 的行：分片直接删除，
+%% 兼容清理旧单体文件中的历史行。
 deleteSessionArtifacts([SessionId]) ->
-    Path = filename:join(storeDir(), "session_artifacts.jsonl"),
-    Rows = readLines("session_artifacts.jsonl"),
-    Sid = toComparable(SessionId),
-    Remaining = [R || R <- Rows,
-                      toComparable(maps:get(<<"sessionId">>, R,
-                          maps:get(sessionId, R, undefined))) =/= Sid],
-    Removed = length(Rows) - length(Remaining),
-    rewriteFile(Path, Remaining),
-    Removed;
+    %% 1) 删除分片文件（新格式，O(1)）
+    ShardPath = sessionArtifactShardPath(SessionId),
+    ShardRemoved = case file:delete(ShardPath) of
+        ok -> invalidateReadCachePath(ShardPath), 1;
+        {error, _} -> 0
+    end,
+    %% 2) 兼容旧单体文件：若存在则按老逻辑过滤重写
+    LegacyPath = filename:join(storeDir(), "session_artifacts.jsonl"),
+    LegacyRemoved = case file:read_file_info(LegacyPath) of
+        {ok, _} ->
+            Rows = readLines("session_artifacts.jsonl"),
+            Sid = toComparable(SessionId),
+            Remaining = [R || R <- Rows,
+                              toComparable(maps:get(<<"sessionId">>, R,
+                                  maps:get(sessionId, R, undefined))) =/= Sid],
+            case length(Rows) - length(Remaining) of
+                0 -> 0;
+                N -> _ = rewriteFile(LegacyPath, Remaining), N
+            end;
+        {error, _} ->
+            0
+    end,
+    ShardRemoved + LegacyRemoved;
 deleteSessionArtifacts(_) ->
     0.
+
+%% 读取某会话的 artifacts：优先读分片文件，回退到旧单体文件。
+readSessionArtifactRows(SessionId) ->
+    ShardPath = sessionArtifactShardPath(SessionId),
+    case readLinesAbs(ShardPath) of
+        [_ | _] = Rows -> Rows;
+        _ -> readLines("session_artifacts.jsonl")
+    end.
 
 %% 按 sessionId 过滤 session_messages 并按 seq 排序，返回含 atom 键的行映射。
 %% JSONL 解码后键为 binary，读取时用 binary 键；返回时转为 atom 键以与
